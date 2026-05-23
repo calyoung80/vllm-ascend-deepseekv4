@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.sequence import IntermediateTensors
 from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
@@ -83,6 +85,155 @@ def split_inputs_tp_to_sp(hidden_states, out):
     hidden_states_curr_rank = hidden_states[start:end]
     out[: hidden_states_curr_rank.shape[0]] = hidden_states_curr_rank
     return out[:padded_num_tokens_per_rank]
+
+
+class _FusedModelWithMTP:
+    """Wraps the main model forward together with ALL MTP steps.
+
+    Used as the ``runnable`` of :class:`ACLGraphWrapper` so that both the
+    main-model forward **and** all N MTP speculative steps are captured
+    into a single ACLGraph.  On replay the entire fused graph runs in one
+    launch on the main stream — no separate graph or stream-sync for MTP.
+
+    Attribute access is transparently delegated to ``raw_model`` so that
+    call-sites like ``self.model.compute_logits(...)`` keep working.
+    """
+
+    def __init__(self, raw_model: nn.Module, drafter: "SpecDecodeBaseProposer"):
+        self.raw_model = raw_model
+        self.drafter = drafter
+        num_spec_tokens = drafter.num_speculative_tokens
+        max_num_reqs = drafter.runner.max_num_reqs
+        max_num_tokens = drafter.runner.max_num_tokens
+        device = drafter.device
+        self.logits_indices_buf = torch.zeros(
+            max_num_reqs * (1 + num_spec_tokens), dtype=torch.int64, device=device)
+        self.draft_token_ids_buf = torch.zeros(
+            (max_num_reqs, num_spec_tokens), dtype=torch.int64, device=device)
+        self.main_next_token_ids_buf = torch.zeros(
+            (max_num_reqs,), dtype=torch.int64, device=device)
+        self.mtp_last_hidden_states_buf = torch.zeros(
+            (max_num_tokens, drafter.hidden_size),
+            dtype=drafter.dtype, device=device)
+        self._state_debug = os.getenv("VLLM_ASCEND_MTP_FUSED_STATE_DEBUG", "0") == "1"
+        self._state_debug_interval = int(os.getenv("VLLM_ASCEND_MTP_FUSED_STATE_DEBUG_INTERVAL", "50"))
+        self._state_debug_counter = 0
+        self._force_state_debug_once = False
+
+    def __getattr__(self, key: str):
+        return getattr(self.raw_model, key)
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = self.raw_model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+        forward_context = get_forward_context()
+        is_capturing = getattr(forward_context, 'capturing', False)
+        
+        num_tokens_dbg = input_ids.shape[0]
+        num_spec_dbg = self.drafter.num_speculative_tokens
+        batch_size_dbg = max(num_tokens_dbg // (num_spec_dbg + 1), 1)
+        cudagraph_mode_dbg = str(getattr(forward_context, 'cudagraph_runtime_mode', 'NONE'))
+        
+        # Capture-safe entry log: only print shapes in capture mode, no CPU sync
+        wrapper_force_debug_once = bool(getattr(self.drafter, "_force_state_debug_once", False))
+        emit_wrapper_debug = (self._state_debug or wrapper_force_debug_once)
+        if is_capturing and self._state_debug:
+            logger.info(
+                "[MTP_FUSED_DEBUG] B2_wrapper_entry_capture is_capturing=True cudagraph_mode=%s num_tokens=%d batch_size=%d draft_buf_shape=%s li_buf_shape=%s",
+                cudagraph_mode_dbg,
+                num_tokens_dbg,
+                batch_size_dbg,
+                tuple(self.draft_token_ids_buf.shape),
+                tuple(self.logits_indices_buf.shape),
+            )
+        
+        # Only run fused draft generation during graph capture/replay setup.
+        # Profile/warmup paths may invoke this runnable outside capture, where
+        # the draft-step shape assumptions do not hold. Prefill still skips
+        # draft execution because hidden_states is IntermediateTensors there.
+        if is_capturing and not isinstance(hidden_states, IntermediateTensors):
+            raw_hidden = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            if getattr(forward_context, 'flash_comm_v1_enabled', False):
+                from vllm.distributed import tensor_model_parallel_all_gather
+                raw_hidden = tensor_model_parallel_all_gather(raw_hidden, 0)
+                pad_size = getattr(forward_context, 'pad_size', 0)
+                if pad_size > 0:
+                    raw_hidden = raw_hidden[:-pad_size, :]
+            num_tokens = input_ids.shape[0]
+            num_spec = self.drafter.num_speculative_tokens
+            batch_size = max(num_tokens // (num_spec + 1), 1)
+            if emit_wrapper_debug and (not is_capturing) and batch_size == 1:
+                try:
+                    li_dbg = self.logits_indices_buf[: min(4, self.logits_indices_buf.shape[0])].detach().to("cpu").tolist()
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] fused_wrapper_step0_indices num_tokens=%d batch_size=%d li_head=%s",
+                        num_tokens,
+                        batch_size,
+                        li_dbg,
+                    )
+                except Exception as e:
+                    logger.warning("[MTP_FUSED_DEBUG] fused_wrapper_step0_indices failed: %r", e)
+            step0_logits_indices = self.logits_indices_buf[:batch_size].clone().to(
+                dtype=torch.long)
+            sample_hs = raw_hidden[step0_logits_indices]
+            main_logits = self.raw_model.compute_logits(sample_hs)
+            next_token_ids = main_logits.argmax(dim=-1)
+            self.main_next_token_ids_buf[:batch_size].copy_(next_token_ids[:batch_size])
+            all_draft_ids = self.drafter.propose_all_in_graph(
+                hidden_states=raw_hidden,
+                input_ids=input_ids,
+                positions=positions,
+                logits_indices=self.logits_indices_buf,
+                step0_logits_indices=step0_logits_indices,
+                next_token_ids=next_token_ids,
+                num_tokens=num_tokens,
+            )
+            num_reqs = all_draft_ids.shape[0]
+            if emit_wrapper_debug and (not is_capturing) and num_reqs == 1:
+                try:
+                    draft_head_dbg = all_draft_ids[:1, : min(4, all_draft_ids.shape[1])].detach().to("cpu").tolist()
+                    buf_head_pre_dbg = self.draft_token_ids_buf[:1, : min(4, self.draft_token_ids_buf.shape[1])].detach().to("cpu").tolist()
+                    next_head_dbg = next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist()
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] fused_wrapper_draft_write_pre next_head=%s all_draft_head=%s draft_buf_pre=%s",
+                        next_head_dbg,
+                        draft_head_dbg,
+                        buf_head_pre_dbg,
+                    )
+                except Exception as e:
+                    logger.warning("[MTP_FUSED_DEBUG] fused_wrapper_draft_write_pre failed: %r", e)
+            self.draft_token_ids_buf[:num_reqs, :all_draft_ids.shape[1]].copy_(
+                all_draft_ids)
+            if emit_wrapper_debug and (not is_capturing) and num_reqs == 1:
+                try:
+                    buf_head_post_dbg = self.draft_token_ids_buf[:1, : min(4, self.draft_token_ids_buf.shape[1])].detach().to("cpu").tolist()
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] fused_wrapper_draft_write_post draft_buf_post=%s",
+                        buf_head_post_dbg,
+                    )
+                except Exception as e:
+                    logger.warning("[MTP_FUSED_DEBUG] fused_wrapper_draft_write_post failed: %r", e)
+        else:
+            # Prefill phase: hidden_states is IntermediateTensors, skip draft execution.
+            if self._state_debug:
+                logger.info(
+                    "[MTP_FUSED_DEBUG] fused_wrapper_prefill_skip hidden_states_type=IntermediateTensors num_tokens=%d batch_size=%d",
+                    num_tokens_dbg,
+                    batch_size_dbg,
+                )
+        return hidden_states
 
 
 class SpecDecodeBaseProposer(EagleProposer):
@@ -176,6 +327,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=device)
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
+
+        # NPU aclnnIndexPutImpl in fused MTP path requires int64 self tensor.
+        if self.method == "mtp" and hasattr(self, "input_ids") and self.input_ids.dtype != torch.int64:
+            self.input_ids = self.input_ids.to(torch.int64)
 
     def _get_model(self) -> nn.Module:
         """
@@ -339,7 +494,8 @@ class SpecDecodeBaseProposer(EagleProposer):
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
             if self.method == "mtp":
-                self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+                if not getattr(self, 'fused_with_main_graph', False):
+                    self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
             else:
                 self._runnable = ACLGraphWrapper(
                     self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
@@ -362,6 +518,426 @@ class SpecDecodeBaseProposer(EagleProposer):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def propose_all_in_graph(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        logits_indices: torch.Tensor,
+        step0_logits_indices: torch.Tensor | None,
+        next_token_ids: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Run ALL MTP steps inside the main model's ACLGraph.
+
+        Called by :class:`_FusedModelWithMTP` so that main model forward
+        plus all N MTP steps are recorded/replayed as a **single** graph.
+        Returns ``draft_token_ids`` of shape ``(batch_size, num_speculative_tokens)``.
+        """
+        batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        raw_model = self.get_model()
+
+        # Defensive init for debug attrs: some deployments may load proposer
+        # instances that predate debug fields.
+        if not hasattr(self, "_state_debug"):
+            self._state_debug = os.getenv("VLLM_ASCEND_MTP_FUSED_STATE_DEBUG", "0") == "1"
+        if not hasattr(self, "_state_debug_interval"):
+            self._state_debug_interval = int(os.getenv("VLLM_ASCEND_MTP_FUSED_STATE_DEBUG_INTERVAL", "50"))
+        if not hasattr(self, "_state_debug_counter"):
+            self._state_debug_counter = 0
+        if not hasattr(self, "_force_state_debug_once"):
+            self._force_state_debug_once = False
+
+        self._state_debug_counter += 1
+        do_state_debug = (
+            self._force_state_debug_once
+            or (
+                self._state_debug
+                and self._state_debug_interval > 0
+                and self._state_debug_counter % self._state_debug_interval == 0
+            )
+        )
+
+        # Never do debug scalar/tensor reads in graph-capturing phase.
+        # Ascend forbids stream synchronize on captured stream.
+        forward_context = get_forward_context()
+        in_capture = bool(getattr(forward_context, "capturing", False))
+        if in_capture:
+            if self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
+                logger.info(
+                    "[MTP_FUSED_DEBUG] graph_step0_capture_mode num_tokens=%d batch_size=%d logits_shape=%s input_dtype=%s next_dtype=%s",
+                    num_tokens,
+                    batch_size,
+                    tuple(logits_indices.shape),
+                    str(input_ids.dtype),
+                    str(next_token_ids.dtype),
+                )
+            do_state_debug = False
+
+        if self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_entry_ctx in_capture=%s counter=%d interval=%d num_tokens=%d batch_size=%d logits_shape=%s input_shape=%s positions_shape=%s next_shape=%s",
+                str(in_capture),
+                self._state_debug_counter,
+                self._state_debug_interval,
+                num_tokens,
+                batch_size,
+                tuple(logits_indices.shape),
+                tuple(input_ids.shape),
+                tuple(positions.shape),
+                tuple(next_token_ids.shape),
+            )
+
+        # Flush one capture-safe snapshot at first non-capture opportunity.
+        if (not in_capture) and hasattr(self, "_capture_step0_snapshot"):
+            try:
+                snap = self._capture_step0_snapshot
+                logger.info(
+                    "[MTP_FUSED_DEBUG] graph_step0_capture_snapshot num_tokens=%d batch_size=%d li_head=%s pre_head=%s post_head=%s",
+                    int(snap["num_tokens"]),
+                    int(snap["batch_size"]),
+                    snap["li_head"].detach().to("cpu").tolist(),
+                    snap["pre_head"].detach().to("cpu").tolist(),
+                    snap["post_head"].detach().to("cpu").tolist(),
+                )
+            except Exception as _e:
+                logger.warning("[MTP_FUSED_DEBUG] graph_step0_capture_snapshot flush failed: %s", repr(_e))
+            finally:
+                delattr(self, "_capture_step0_snapshot")
+
+        if step0_logits_indices is None:
+            step0_logits_indices = logits_indices[:batch_size].clone().to(
+                dtype=torch.long)
+
+        li_head_dbg = logits_indices[: min(8, logits_indices.shape[0])]
+        pre_in_head_dbg = self.input_ids[: min(8, num_tokens)].detach().to("cpu") if do_state_debug else None
+        pre_in_li0_dbg = None
+        li0_dbg = -1
+        if do_state_debug:
+            li0_dbg = int(logits_indices[0].item()) if logits_indices.numel() > 0 else -1
+            if li0_dbg >= 0 and li0_dbg < self.input_ids.shape[0]:
+                pre_in_li0_dbg = int(self.input_ids[li0_dbg].item())
+
+        # Assemble step-0 input ids in local tensor to avoid shared-buffer state pollution.
+        work_input_ids = self.input_ids[:num_tokens].clone()
+        shifted_input_ids = input_ids[1:num_tokens].clone()
+        work_input_ids[: num_tokens - 1] = shifted_input_ids
+
+        # Prefer index_copy_ over advanced indexing assignment in graph mode.
+        # This makes index write semantics explicit and more stable for capture/replay.
+        li = step0_logits_indices.contiguous()
+        if num_tokens > 0:
+            li = li.clamp_(0, num_tokens - 1)
+        next_ids_cast = next_token_ids[:batch_size].to(work_input_ids.dtype)
+        work_input_ids.index_copy_(0, li, next_ids_cast)
+
+        self._set_positions(num_tokens, positions[:num_tokens])
+        self.hidden_states[:num_tokens].copy_(hidden_states[:num_tokens])
+
+        # Capture-safe probe: keep tensors on device, no scalar reads or CPU copies.
+        if in_capture and self._state_debug:
+            head_n = min(8, num_tokens)
+            li_n = min(8, logits_indices.shape[0])
+            self._capture_step0_snapshot = {
+                "num_tokens": num_tokens,
+                "batch_size": batch_size,
+                "li_head": logits_indices[:li_n].clone(),
+                "pre_head": self.input_ids[:head_n].clone(),
+                "post_head": work_input_ids[:head_n].clone(),
+            }
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_step0_capture_meta num_tokens=%d batch_size=%d li_slice_shape=%s input_shape=%s work_shape=%s input_stride=%s work_stride=%s input_off=%d work_off=%d input_ptr=%d work_ptr=%d li_dtype=%s input_dtype=%s work_dtype=%s",
+                num_tokens,
+                batch_size,
+                tuple(logits_indices[:batch_size].shape),
+                tuple(self.input_ids[:num_tokens].shape),
+                tuple(work_input_ids.shape),
+                tuple(self.input_ids.stride()),
+                tuple(work_input_ids.stride()),
+                int(self.input_ids.storage_offset()),
+                int(work_input_ids.storage_offset()),
+                int(self.input_ids.data_ptr()),
+                int(work_input_ids.data_ptr()),
+                str(logits_indices.dtype),
+                str(self.input_ids.dtype),
+                str(work_input_ids.dtype),
+            )
+
+        if do_state_debug:
+            post_in_head_dbg = work_input_ids[: min(8, num_tokens)].detach().to("cpu")
+            post_in_li0_dbg = -1
+            if li0_dbg >= 0 and li0_dbg < work_input_ids.shape[0]:
+                post_in_li0_dbg = int(work_input_ids[li0_dbg].item())
+            next0_dbg = int(next_token_ids[0].item()) if next_token_ids.numel() > 0 else -1
+            write_ok = (post_in_li0_dbg == next0_dbg) if li0_dbg >= 0 else False
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_step0_write_check li0=%d post_li0=%d next0=%d ok=%s",
+                li0_dbg,
+                post_in_li0_dbg,
+                next0_dbg,
+                str(write_ok),
+            )
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_step0_prepost num_tokens=%d batch_size=%d li0=%d li_head=%s pre_li0=%s post_li0=%d next0=%d pre_head=%s post_head=%s",
+                num_tokens,
+                batch_size,
+                li0_dbg,
+                li_head_dbg.detach().to("cpu").tolist(),
+                str(pre_in_li0_dbg),
+                post_in_li0_dbg,
+                next0_dbg,
+                pre_in_head_dbg.tolist() if pre_in_head_dbg is not None else [],
+                post_in_head_dbg.tolist(),
+            )
+
+        model_input_ids = work_input_ids
+        model_positions = self._get_positions(num_tokens)
+        model_hidden_states = self.hidden_states[:num_tokens]
+        model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+            model_hidden_states, model_positions)
+
+        model_kwargs: dict[str, torch.Tensor] = {
+            "input_ids": model_input_ids,
+            "positions": model_positions,
+        }
+        if self.pass_hidden_states_to_model:
+            model_kwargs["hidden_states"] = model_hidden_states
+            if self.method == "mtp":
+                model_kwargs["positions"] = model_positions
+
+        ret_hidden_states = raw_model(**model_kwargs)
+        if not self.model_returns_tuple():
+            last_hidden_states = ret_hidden_states
+            hidden_states_out = last_hidden_states
+        else:
+            last_hidden_states, hidden_states_out = ret_hidden_states
+
+        last_hidden_states, model_positions, hidden_states_out = (
+            self.maybe_all_gather_and_unpad(
+                last_hidden_states, model_positions, hidden_states_out))
+
+        sample_hs = last_hidden_states[step0_logits_indices]
+        if do_state_debug:
+            hs_shape = tuple(sample_hs.shape)
+            hs_l2 = float(sample_hs.float().pow(2).mean().sqrt().item()) if sample_hs.numel() > 0 else 0.0
+            li_runtime_dbg = step0_logits_indices[: min(4, batch_size)].detach().to("cpu").tolist()
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_step0_sample_hs li_head=%s runtime_li_head=%s hs_shape=%s hs_l2=%.6f",
+                li_head_dbg.detach().to("cpu").tolist(),
+                li_runtime_dbg,
+                hs_shape,
+                hs_l2,
+            )
+            self._force_state_debug_once = False
+        logits = raw_model.compute_logits(sample_hs)
+        draft_token_ids = logits.argmax(dim=-1)
+        if do_state_debug:
+            try:
+                vocab_n = min(4, logits.shape[-1]) if logits.ndim > 1 else 0
+                draft_head_dbg = draft_token_ids[: min(4, draft_token_ids.shape[0])].detach().to("cpu").tolist()
+                next_head_dbg = next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist() if isinstance(next_token_ids, torch.Tensor) else []
+                logits_topk_dbg = []
+                logits_topv_dbg = []
+                if logits.ndim == 2 and logits.shape[0] > 0 and vocab_n > 0:
+                    topv, topi = torch.topk(logits[:1], k=vocab_n, dim=-1)
+                    logits_topk_dbg = topi[0].detach().to("cpu").tolist()
+                    logits_topv_dbg = [float(x) for x in topv[0].detach().to("cpu").tolist()]
+                logger.info(
+                    "[MTP_FUSED_DEBUG] graph_step0_logits_probe next_head=%s draft_head=%s top_idx=%s top_val=%s",
+                    next_head_dbg,
+                    draft_head_dbg,
+                    logits_topk_dbg,
+                    logits_topv_dbg,
+                )
+            except Exception as _e:
+                logger.warning("[MTP_FUSED_DEBUG] graph_step0_logits_probe failed: %s", repr(_e))
+
+        # Sentinel: detect suspicious zero-heavy draft outputs in fused path.
+        # Only run in non-capture debug mode to avoid stream-sync risks.
+        if do_state_debug:
+            try:
+                zero_cnt = int((draft_token_ids == 0).sum().item()) if draft_token_ids.numel() > 0 else 0
+                all_zero = (draft_token_ids.numel() > 0 and zero_cnt == int(draft_token_ids.numel()))
+                # Trigger on all-zero or very high zero ratio with non-trivial batch.
+                if all_zero or (draft_token_ids.numel() >= 8 and zero_cnt * 100 >= int(draft_token_ids.numel()) * 80):
+                    li_dbg = li_head_dbg.detach().to("cpu").tolist()
+                    in_head_dbg = self.input_ids[: min(16, num_tokens)].detach().to("cpu").tolist()
+                    next_head_dbg = next_token_ids[: min(8, next_token_ids.shape[0])].detach().to("cpu").tolist() if isinstance(next_token_ids, torch.Tensor) else []
+                    draft_head_dbg = draft_token_ids[: min(8, draft_token_ids.shape[0])].detach().to("cpu").tolist()
+                    logger.warning(
+                        "[MTP_FUSED_DEBUG] draft_zero_sentinel num_tokens=%d batch_size=%d zeros=%d total=%d all_zero=%s li_head=%s next_head=%s draft_head=%s input_ids_head16=%s",
+                        num_tokens,
+                        batch_size,
+                        zero_cnt,
+                        int(draft_token_ids.numel()),
+                        str(all_zero),
+                        li_dbg,
+                        next_head_dbg,
+                        draft_head_dbg,
+                        in_head_dbg,
+                    )
+            except Exception as _e:
+                logger.warning("[MTP_FUSED_DEBUG] draft_zero_sentinel failed: %s", repr(_e))
+
+        forward_context = get_forward_context()
+        draft_attn_metadatas = getattr(
+            forward_context, 'draft_attn_metadatas', None)
+
+        has_meta_dbg = bool(draft_attn_metadatas)
+        meta_len_dbg = len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1
+        # Cache runtime metadata status for out-of-context shadow diagnostics.
+        self._last_graph_meta_status = {
+            "has_meta": has_meta_dbg,
+            "meta_len": meta_len_dbg,
+            "total_steps": self.num_speculative_tokens,
+            "active_meta_id": id(getattr(forward_context, "attn_metadata", None)),
+            "selected_meta_id": id(draft_attn_metadatas[0]) if has_meta_dbg else -1,
+            "selected_meta_type": type(draft_attn_metadatas[0]).__name__ if has_meta_dbg else "None",
+        }
+
+        if self._state_debug:
+            logger.info(
+                "[MTP_FUSED_DEBUG] graph_step_meta_status has_meta=%s meta_len=%d total_steps=%d",
+                str(draft_attn_metadatas is not None),
+                meta_len_dbg,
+                self.num_speculative_tokens,
+            )
+            if not draft_attn_metadatas:
+                logger.warning(
+                    "[MTP_FUSED_DEBUG] graph_step_meta_missing total_steps=%d draft_attn_metadatas=%s",
+                    self.num_speculative_tokens,
+                    "None_or_empty",
+                )
+
+        if self.num_speculative_tokens == 1:
+            if draft_attn_metadatas and len(draft_attn_metadatas) > 0:
+                forward_context.attn_metadata = draft_attn_metadatas[0]
+                self._last_graph_meta_status = {
+                    "has_meta": True,
+                    "meta_len": len(draft_attn_metadatas),
+                    "total_steps": self.num_speculative_tokens,
+                    "active_meta_id": id(getattr(forward_context, "attn_metadata", None)),
+                    "selected_meta_id": id(draft_attn_metadatas[0]),
+                    "selected_meta_type": type(getattr(forward_context, "attn_metadata", None)).__name__,
+                }
+                if self._state_debug:
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] graph_step_meta_switch step=%d total_steps=%d meta_len=%d active_meta_id=%d selected_meta_id=%d active_meta_type=%s",
+                        0,
+                        self.num_speculative_tokens,
+                        len(draft_attn_metadatas),
+                        id(getattr(forward_context, "attn_metadata", None)),
+                        id(draft_attn_metadatas[0]),
+                        type(getattr(forward_context, "attn_metadata", None)).__name__,
+                    )
+            return draft_token_ids.view(-1, 1)
+
+        draft_token_ids_tensor = torch.zeros(
+            (self.num_speculative_tokens, *draft_token_ids.shape),
+            dtype=draft_token_ids.dtype, device=self.device)
+        draft_token_ids_tensor[0] = draft_token_ids
+
+        step_positions = self.positions[logits_indices[:batch_size]]
+        step_hidden_states = hidden_states_out[logits_indices[:batch_size]]
+        token_indices_to_sample = self.arange[:batch_size]
+
+        # Ensure draft step-0 uses drafter metadata instead of main-model metadata.
+        if draft_attn_metadatas and len(draft_attn_metadatas) > 0:
+            forward_context.attn_metadata = draft_attn_metadatas[0]
+            if self._state_debug:
+                logger.info(
+                    "[MTP_FUSED_DEBUG] graph_step_meta_switch step=%d total_steps=%d meta_len=%d active_meta_id=%d selected_meta_id=%d active_meta_type=%s",
+                    0,
+                    self.num_speculative_tokens,
+                    len(draft_attn_metadatas),
+                    id(getattr(forward_context, "attn_metadata", None)),
+                    id(draft_attn_metadatas[0]),
+                    type(getattr(forward_context, "attn_metadata", None)).__name__,
+                )
+
+        for draft_step in range(self.num_speculative_tokens - 1):
+            if self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
+                logger.info(
+                    "[MTP_FUSED_DEBUG] graph_step_meta_probe step=%d has_meta=%s meta_len=%d",
+                    draft_step + 1,
+                    str(draft_attn_metadatas is not None),
+                    len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1,
+                )
+            step_input_ids = draft_token_ids_tensor[draft_step]
+            step_positions = step_positions + 1
+
+            exceeds_max_model_len = (
+                step_positions >= self.vllm_config.model_config.max_model_len)
+            clamped_positions = torch.where(exceeds_max_model_len, 0,
+                                            step_positions)
+
+            work_input_ids = work_input_ids.clone()
+            work_input_ids[:batch_size] = step_input_ids
+            self._set_positions(batch_size, clamped_positions)
+            self.hidden_states[:batch_size] = step_hidden_states
+
+            model_input_ids = work_input_ids
+            model_positions = self._get_positions(num_tokens)
+            model_hidden_states = self.hidden_states[:num_tokens]
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                model_hidden_states, model_positions)
+
+            if draft_attn_metadatas and draft_step + 1 < len(
+                    draft_attn_metadatas):
+                forward_context.attn_metadata = draft_attn_metadatas[
+                    draft_step + 1]
+                self._last_graph_meta_status = {
+                    "has_meta": True,
+                    "meta_len": len(draft_attn_metadatas),
+                    "total_steps": self.num_speculative_tokens,
+                    "active_meta_id": id(getattr(forward_context, "attn_metadata", None)),
+                    "selected_meta_id": id(draft_attn_metadatas[draft_step + 1]),
+                    "selected_meta_type": type(getattr(forward_context, "attn_metadata", None)).__name__,
+                }
+                if self._state_debug:
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] graph_step_meta_switch step=%d total_steps=%d meta_len=%d active_meta_id=%d selected_meta_id=%d active_meta_type=%s",
+                        draft_step + 1,
+                        self.num_speculative_tokens,
+                        len(draft_attn_metadatas),
+                        id(getattr(forward_context, "attn_metadata", None)),
+                        id(draft_attn_metadatas[draft_step + 1]),
+                        type(getattr(forward_context, "attn_metadata", None)).__name__,
+                    )
+            elif self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
+                logger.warning(
+                    "[MTP_FUSED_DEBUG] graph_step_meta_unavailable step=%d reason=%s meta_len=%d",
+                    draft_step + 1,
+                    "none_or_short",
+                    len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1,
+                )
+
+            model_kwargs = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = model_hidden_states
+
+            ret_hidden_states = raw_model(**model_kwargs)
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+                hidden_states_out = last_hidden_states
+            else:
+                last_hidden_states, hidden_states_out = ret_hidden_states
+
+            last_hidden_states, model_positions, hidden_states_out = (
+                self.maybe_all_gather_and_unpad(
+                    last_hidden_states, model_positions, hidden_states_out))
+
+            sample_hs = last_hidden_states[token_indices_to_sample]
+            logits = raw_model.compute_logits(sample_hs)
+            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+            step_hidden_states = hidden_states_out[:batch_size]
+
+        return draft_token_ids_tensor.swapaxes(0, 1)
 
     def shallow_copy_metadata(self, attn_metadata):
         # Currently, new objects will be assigned to the lists in attn_metadata
@@ -445,6 +1021,8 @@ class SpecDecodeBaseProposer(EagleProposer):
                 for layer_name in self.attn_layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata_eagle
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
+
+        self._last_dummy_attn_metadata = multi_steps_attn_metadata
 
         model_positions = self._get_positions(num_tokens)
 
@@ -767,9 +1345,6 @@ class SpecDecodeBaseProposer(EagleProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
-        # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
-        # speculative tokens' proposings. `model_input_ids`, `model_positions` and
-        # `model_hidden_states` represent the speculative model inputs.
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
@@ -799,7 +1374,6 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         num_indices = token_indices_to_sample.shape[0]
         if self.pcp_size > 1:
-            # remove graph padding before all_gather
             hidden_states = hidden_states[:num_tokens]
             hidden_states = get_pcp_group().all_gather(hidden_states, 0)
             hidden_states = torch.index_select(
@@ -808,7 +1382,6 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.method == "mtp":
                 last_hidden_states = hidden_states
             else:
-                # eagle and eagle3 need allgather last_hidden_states.
                 last_hidden_states = last_hidden_states[:num_tokens]
                 last_hidden_states = get_pcp_group().all_gather(last_hidden_states, 0)
                 last_hidden_states = torch.index_select(
@@ -993,6 +1566,11 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.input_ids[: num_tokens - 1] = target_token_ids[1:]
             # Replace the last token with the next token.
             # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+            # Keep index/value dtype aligned with input_ids on NPU index_put.
+            if token_indices_to_sample.dtype != self.input_ids.dtype:
+                token_indices_to_sample = token_indices_to_sample.to(self.input_ids.dtype)
+            if next_token_ids.dtype != self.input_ids.dtype:
+                next_token_ids = next_token_ids.to(self.input_ids.dtype)
             self.input_ids[token_indices_to_sample] = next_token_ids
 
             assert self.runner is not None

@@ -744,13 +744,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         speculative_config=None,
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
+        draft_attn_layer_names=None,
     ):
         if _EXTRA_CTX.is_draft_model:
             graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        # FIXME: Behold! We are using a temporary hack here to update the args
-        # for each layer's attention op in the graph.
+        draft_names = set(draft_attn_layer_names) if draft_attn_layer_names else set()
         with torch.npu.stream(update_stream):
             for key, param, handle, event in zip(
                 forward_context.attn_metadata,
@@ -779,7 +779,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                     fak_descale_float,
                 ) = param
                 seq_lens_list = forward_context.attn_metadata[key].decode.seq_lens_list
-                if speculative_config and speculative_config.method == "mtp" and not _EXTRA_CTX.is_draft_model:
+                if key in draft_names:
+                    actual_seq_lengths = forward_context.attn_metadata[key].decode.actual_seq_lengths_q
+                    block_table = forward_context.attn_metadata[key].decode.block_table
+                    if speculative_config and speculative_config.disable_padded_drafter_batch:
+                        block_table = block_table[: len(actual_seq_lengths)]
+                    seq_lens_list = seq_lens_list + [0] * (len(actual_seq_lengths) - len(seq_lens_list))
+                elif speculative_config and speculative_config.method == "mtp" and not _EXTRA_CTX.is_draft_model:
                     actual_seq_lengths = forward_context.attn_metadata[key].decode.actual_seq_lengths_q
                     spec_multiple = speculative_config.num_speculative_tokens + 1
                     seq_lens_list = seq_lens_list + [0] * (num_tokens // spec_multiple - len(seq_lens_list))

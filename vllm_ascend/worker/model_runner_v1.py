@@ -18,6 +18,8 @@
 #
 
 import math
+import os
+import inspect
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -91,6 +93,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -132,7 +135,7 @@ from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer, _FusedModelWithMTP
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
@@ -315,27 +318,24 @@ class NPUModelRunner(GPUModelRunner):
 
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config,
                                     "compress_ratios")
-        if self.use_compress:
-            self.attn_backend = get_attn_backend(
-                0,
-                self.dtype,
-                None,
-                self.block_size,
-                use_mla=self.model_config.use_mla,
-                use_sparse=self.use_sparse,
-                use_compress=self.use_compress,
-                use_mm_prefix=self.model_config is not None
-                and self.model_config.is_mm_prefix_lm)
-        else:
-            self.attn_backend = get_attn_backend(
-                0,
-                self.dtype,
-                None,
-                self.block_size,
-                use_mla=self.model_config.use_mla,
-                use_sparse=self.use_sparse,
-                use_mm_prefix=self.model_config is not None
-                and self.model_config.is_mm_prefix_lm)
+        # get_attn_backend signature differs between upstream vLLM and
+        # vllm-ascend patched selector. Build kwargs by signature to stay
+        # compatible with both.
+        _attn_params = inspect.signature(get_attn_backend).parameters
+        _attn_kwargs = {
+            "head_size": 0,
+            "dtype": self.dtype,
+            "kv_cache_dtype": None,
+            "use_mla": self.model_config.use_mla,
+            "use_sparse": self.use_sparse,
+            "use_mm_prefix": self.model_config is not None
+            and self.model_config.is_mm_prefix_lm,
+        }
+        if "block_size" in _attn_params:
+            _attn_kwargs["block_size"] = self.block_size
+        if "use_compress" in _attn_params:
+            _attn_kwargs["use_compress"] = self.use_compress
+        self.attn_backend = get_attn_backend(**_attn_kwargs)
 
         try:
             self.dcp_size = get_dcp_group().world_size
@@ -441,6 +441,25 @@ class NPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
+        self._fused_mtp_wrapper: _FusedModelWithMTP | None = None
+        self._fused_mtp_path_logged = False
+        self._non_fused_mtp_path_logged = False
+        self._mtp_debug_counter = 0
+        self._mtp_debug_log_interval = 100
+        self._fused_mtp_force_enable = envs.VLLM_ASCEND_ENABLE_MTP_FUSED
+        self._mtp_shadow_compare = os.getenv("VLLM_ASCEND_MTP_SHADOW_COMPARE", "0") == "1"
+        self._mtp_shadow_compare_disabled = False
+        self._mtp_shadow_compare_err_count = 0
+        self._mtp_shadow_compare_interval = int(os.getenv("VLLM_ASCEND_MTP_SHADOW_COMPARE_INTERVAL", "0"))
+        self._mtp_shadow_compare_max_reqs = int(os.getenv("VLLM_ASCEND_MTP_SHADOW_COMPARE_MAX_REQS", "1"))
+        self._mtp_shadow_compare_max_tokens = int(os.getenv("VLLM_ASCEND_MTP_SHADOW_COMPARE_MAX_TOKENS", "3"))
+        self._mtp_trace_counter = 0
+        self._last_mtp_stage_snapshot = None
+        self._mtp_shadow_log_max_ranks = int(os.getenv("VLLM_ASCEND_MTP_SHADOW_LOG_MAX_RANKS", "2"))
+        self._mtp_debug_level = int(os.getenv("VLLM_ASCEND_MTP_DEBUG_LEVEL", "1"))
+        self._mtp_fallback_b1 = os.getenv("VLLM_ASCEND_MTP_FALLBACK_B1", "1") == "1"
+        self._mtp_fallback_b2 = os.getenv("VLLM_ASCEND_MTP_FALLBACK_B2", "1") == "1"
+        self._mtp_forward_debug_counter = 0
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
         self.query_lens: torch.Tensor | None = None
@@ -544,9 +563,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, ACLGraphWrapper):
-            return self.model.unwrap()
-        return self.model
+        model = self.model
+        if isinstance(model, ACLGraphWrapper):
+            model = model.unwrap()
+        if isinstance(model, _FusedModelWithMTP):
+            model = model.raw_model
+        return model
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -1010,6 +1032,20 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        self._mtp_trace_counter += 1
+        trace_id = int(self._mtp_trace_counter)
+        stage_snapshot = {
+            "trace_id": trace_id,
+            "num_scheduled_tokens": int(num_scheduled_tokens),
+            "spec_present": int(spec_decode_metadata is not None),
+            "sampled_shape": tuple(valid_sampled_token_ids.shape) if isinstance(valid_sampled_token_ids, torch.Tensor) else (),
+            "sampled_dtype": str(valid_sampled_token_ids.dtype) if isinstance(valid_sampled_token_ids, torch.Tensor) else type(valid_sampled_token_ids).__name__,
+            "valid_count_head": [],
+            "next_token_head": [],
+            "token_indices_head": [],
+            "token_indices_dtype": "",
+            "qsl_head": [],
+        }
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1052,6 +1088,11 @@ class NPUModelRunner(GPUModelRunner):
                     self.num_discarded_requests,
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                try:
+                    stage_snapshot["valid_count_head"] = valid_sampled_tokens_count[: min(4, valid_sampled_tokens_count.shape[0])].detach().to("cpu").tolist()
+                    stage_snapshot["next_token_head"] = next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist()
+                except Exception:
+                    pass
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
@@ -1121,6 +1162,16 @@ class NPUModelRunner(GPUModelRunner):
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
+            try:
+                if isinstance(token_indices_to_sample, torch.Tensor):
+                    stage_snapshot["token_indices_head"] = token_indices_to_sample[: min(8, token_indices_to_sample.shape[0])].detach().to("cpu").tolist()
+                    stage_snapshot["token_indices_dtype"] = str(token_indices_to_sample.dtype)
+                if spec_decode_common_attn_metadata is not None and getattr(spec_decode_common_attn_metadata, "query_start_loc", None) is not None:
+                    qsl = spec_decode_common_attn_metadata.query_start_loc
+                    stage_snapshot["qsl_head"] = qsl[: min(8, qsl.shape[0])].detach().to("cpu").tolist()
+            except Exception:
+                pass
+
             assert self.drafter is not None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
@@ -1141,6 +1192,17 @@ class NPUModelRunner(GPUModelRunner):
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
+
+        try:
+            if isinstance(draft_token_ids, torch.Tensor):
+                stage_snapshot["draft_shape"] = tuple(draft_token_ids.shape)
+                stage_snapshot["draft_dtype"] = str(draft_token_ids.dtype)
+            else:
+                stage_snapshot["draft_shape"] = ()
+                stage_snapshot["draft_dtype"] = type(draft_token_ids).__name__
+            self._last_mtp_stage_snapshot = stage_snapshot
+        except Exception:
+            self._last_mtp_stage_snapshot = None
 
         return draft_token_ids
 
@@ -1391,6 +1453,7 @@ class NPUModelRunner(GPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
                 input_ids=input_ids,
+                draft_attn_metadatas=(getattr(self.drafter, "_last_dummy_attn_metadata", None) if self._fused_mtp_wrapper is not None and self.drafter is not None else None),
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1399,6 +1462,76 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if self._fused_mtp_wrapper is not None:
+                buf = self._fused_mtp_wrapper.logits_indices_buf
+                idx_len = logits_indices.shape[0]
+
+                # Keep fused step-0 sampling index semantics aligned with
+                # non-fused proposer path: query_start_loc[1:] - 1.
+                # This avoids drift when upstream logits_indices semantics differ.
+                use_aligned_indices = False
+                num_reqs = self.input_batch.num_reqs
+                if (
+                    spec_decode_common_attn_metadata is not None
+                    and num_reqs > 0
+                ):
+                    try:
+                        qsl = spec_decode_common_attn_metadata.query_start_loc
+                        aligned = qsl[1:num_reqs + 1] - 1
+                        if aligned.numel() == num_reqs:
+                            buf[:num_reqs].copy_(aligned.to(buf.dtype))
+                            if num_reqs < buf.shape[0]:
+                                buf[num_reqs:].zero_()
+                            use_aligned_indices = True
+                    except Exception:
+                        use_aligned_indices = False
+
+                if not use_aligned_indices:
+                    buf[:idx_len].copy_(logits_indices[:idx_len])
+                    buf[idx_len:].zero_()
+
+                if self._mtp_debug_level >= 1 and num_reqs == 1:
+                    try:
+                        buf_head_dbg = buf[: min(4, buf.shape[0])].detach().to("cpu").tolist()
+                        aligned_head_dbg = []
+                        if use_aligned_indices:
+                            aligned_head_dbg = aligned[: min(4, aligned.shape[0])].detach().to("cpu").tolist()
+                        raw_head_dbg = logits_indices[: min(4, idx_len)].detach().to("cpu").tolist() if idx_len > 0 else []
+                        qsl_head_dbg = []
+                        if spec_decode_common_attn_metadata is not None:
+                            qsl_dbg = getattr(spec_decode_common_attn_metadata, "query_start_loc", None)
+                            if qsl_dbg is not None:
+                                qsl_head_dbg = qsl_dbg[: min(4, qsl_dbg.shape[0])].detach().to("cpu").tolist()
+                        logger.info(
+                            "[MTP_FUSED_DEBUG] fused_idx_write reqs=%d idx_src=%s raw_head=%s aligned_head=%s buf_head=%s qsl_head=%s",
+                            num_reqs,
+                            "query_start_loc" if use_aligned_indices else "logits_indices",
+                            raw_head_dbg,
+                            aligned_head_dbg,
+                            buf_head_dbg,
+                            qsl_head_dbg,
+                        )
+                    except Exception as e:
+                        logger.warning("[MTP_FUSED_DEBUG] fused_idx_write failed: %r", e)
+
+                self._mtp_forward_debug_counter += 1
+                if self._mtp_debug_level >= 2 and self._mtp_forward_debug_counter % self._mtp_debug_log_interval == 0:
+                    li = logits_indices[:idx_len]
+                    li_min = int(li.min().item()) if idx_len > 0 else -1
+                    li_max = int(li.max().item()) if idx_len > 0 else -1
+                    li_head = li[:3].tolist() if idx_len > 0 else []
+                    logger.info("[MTP_FUSED_DEBUG] forward summary reqs=%d num_tokens_padded=%d num_actual=%d logits_idx_len=%d logits_idx_min=%d logits_idx_max=%d logits_idx_head=%s idx_src=%s",
+                                self.input_batch.num_reqs, num_tokens_padded, scheduler_output.total_num_scheduled_tokens, idx_len, li_min, li_max, li_head,
+                                "query_start_loc" if use_aligned_indices else "logits_indices")
+
+                if (
+                    cudagraph_mode == CUDAGraphMode.FULL
+                    and self.drafter is not None
+                    and hasattr(self.drafter, 'draft_attn_groups')
+                    and len(self.drafter.draft_attn_groups) > 0
+                ):
+                    self._inject_mtp_metadata_stubs(get_forward_context())
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -1542,9 +1675,438 @@ class NPUModelRunner(GPUModelRunner):
             self.sampling_done_event.record()
 
         def propose_draft_token_ids(sampled_token_ids):
+            if (
+                self._fused_mtp_wrapper is not None
+                and isinstance(sampled_token_ids, torch.Tensor)
+            ):
+                if not self._fused_mtp_path_logged:
+                    logger.info("[MTP_FUSED_DEBUG] sample_tokens uses fused draft path, sampled_token_ids_shape=%s", tuple(sampled_token_ids.shape))
+                    self._fused_mtp_path_logged = True
+                assert spec_decode_common_attn_metadata is not None
+                assert self.drafter is not None
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        spec_decode_common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_indices.gpu,
+                        self.num_discarded_requests,
+                    )
+                )
+                self._copy_valid_sampled_token_count(
+                    next_token_ids, valid_sampled_tokens_count)
+
+                self._mtp_debug_counter += 1
+                num_reqs = self.input_batch.num_reqs
+                wrapper = self._fused_mtp_wrapper
+                self._draft_token_ids = wrapper.draft_token_ids_buf[:num_reqs]
+
+                # Temporary minimal fallback for fast isolation:
+                # only fallback to non-fused when known unstable req=1 branches are hit.
+                force_non_fused_req1 = False
+                fallback_branch_tag = ""
+                qsl_head_dbg = []
+                try:
+                    has_prefill_dbg = int(
+                        spec_decode_common_attn_metadata is not None
+                        and bool(getattr(spec_decode_common_attn_metadata, "num_prefill_reqs", 0))
+                    )
+                    sampled_shape_dbg = tuple(sampled_token_ids.shape) if isinstance(sampled_token_ids, torch.Tensor) else ()
+                    if spec_decode_common_attn_metadata is not None and getattr(spec_decode_common_attn_metadata, "query_start_loc", None) is not None:
+                        qsl_t = spec_decode_common_attn_metadata.query_start_loc
+                        qsl_head_dbg = qsl_t[: min(2, qsl_t.shape[0])].detach().to("cpu").tolist()
+
+                    branch_b1 = (
+                        num_reqs == 1
+                        and has_prefill_dbg == 0
+                        and sampled_shape_dbg == (1, 2)
+                        and qsl_head_dbg == [0, 2]
+                    )
+                    branch_b2 = (
+                        num_reqs == 1
+                        and has_prefill_dbg == 0
+                        and sampled_shape_dbg == (1, 1)
+                    )
+                    force_non_fused_req1 = (
+                        (self._mtp_fallback_b1 and branch_b1)
+                        or (self._mtp_fallback_b2 and branch_b2)
+                    )
+                    if self._mtp_fallback_b1 and branch_b1:
+                        fallback_branch_tag = "B1_req1_shape12_qsl02"
+                    elif self._mtp_fallback_b2 and branch_b2:
+                        fallback_branch_tag = "B2_req1_shape11_decode"
+                except Exception:
+                    force_non_fused_req1 = False
+                    fallback_branch_tag = ""
+
+                # The fused path drafts before rejection outcomes are known.
+                # If this round rejected any speculative token, recompute once
+                # with non-fused semantics and overwrite the stale draft buffer.
+                needs_rejection_correction = False
+                rejected_head_dbg = []
+                try:
+                    cu_num_draft_tokens = getattr(spec_decode_metadata, "cu_num_draft_tokens", None)
+                    if cu_num_draft_tokens is not None and cu_num_draft_tokens.numel() > 0:
+                        num_draft_tokens_gpu = torch.cat(
+                            [
+                                cu_num_draft_tokens[0:1],
+                                cu_num_draft_tokens[1:] - cu_num_draft_tokens[:-1],
+                            ]
+                        )
+                        valid_counts = valid_sampled_tokens_count.to(num_draft_tokens_gpu.dtype)
+                        num_rejected_tokens_gpu = torch.where(
+                            num_draft_tokens_gpu > 0,
+                            torch.clamp(num_draft_tokens_gpu + 1 - valid_counts, min=0),
+                            torch.zeros_like(num_draft_tokens_gpu),
+                        )
+                        rejected_head_dbg = num_rejected_tokens_gpu[: min(4, num_rejected_tokens_gpu.shape[0])].detach().to("cpu").tolist()
+                        needs_rejection_correction = bool(torch.any(num_rejected_tokens_gpu > 0).item())
+                except Exception:
+                    needs_rejection_correction = False
+                    rejected_head_dbg = []
+
+                if self._mtp_debug_level >= 1 and num_reqs == 1:
+                    try:
+                        sampled_dbg = sampled_token_ids[:1, : min(4, sampled_token_ids.shape[1])].detach().to("cpu").tolist()
+                        next_dbg = next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist()
+                        valid_dbg = valid_sampled_tokens_count[: min(4, valid_sampled_tokens_count.shape[0])].detach().to("cpu").tolist()
+                        draft_buf_dbg = self._draft_token_ids[:1, : min(4, self._draft_token_ids.shape[1])].detach().to("cpu").tolist() if isinstance(self._draft_token_ids, torch.Tensor) and self._draft_token_ids.ndim == 2 else []
+                        logger.info(
+                            "[MTP_FUSED_DEBUG] fused_branch_probe reqs=%d force_non_fused=%s branch=%s sampled_head=%s next_head=%s valid_head=%s draft_buf_head=%s qsl_head=%s",
+                            num_reqs,
+                            str(force_non_fused_req1),
+                            fallback_branch_tag or "fused",
+                            sampled_dbg,
+                            next_dbg,
+                            valid_dbg,
+                            draft_buf_dbg,
+                            qsl_head_dbg,
+                        )
+                    except Exception as e:
+                        logger.warning("[MTP_FUSED_DEBUG] fused_branch_probe failed: %r", e)
+
+                if force_non_fused_req1 or needs_rejection_correction:
+                    shadow_sampled_token_ids = sampled_token_ids
+                    if isinstance(sampled_token_ids, torch.Tensor) and sampled_token_ids.dtype != torch.int32:
+                        shadow_sampled_token_ids = sampled_token_ids.to(torch.int32)
+                    shadow_draft = self.propose_draft_token_ids(
+                        shadow_sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        scheduler_output,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        positions,
+                        scheduler_output.total_num_scheduled_tokens,
+                        hidden_states,
+                        aux_hidden_states,
+                        sample_hidden_states,
+                        batch_desc,
+                    )
+                    if isinstance(shadow_draft, torch.Tensor):
+                        self._draft_token_ids[:num_reqs, :shadow_draft.shape[1]] = shadow_draft[:num_reqs]
+                        if force_non_fused_req1:
+                            logger.info(
+                                "[MTP_FUSED_DEBUG] minimal_fallback_non_fused applied branch=%s reqs=%d sampled_shape=%s qsl_head=%s",
+                                fallback_branch_tag,
+                                num_reqs,
+                                tuple(sampled_token_ids.shape) if isinstance(sampled_token_ids, torch.Tensor) else (),
+                                qsl_head_dbg,
+                            )
+                        elif needs_rejection_correction:
+                            logger.info(
+                                "[MTP_FUSED_DEBUG] postsample_rejection_correction applied reqs=%d rejected_head=%s sampled_shape=%s qsl_head=%s",
+                                num_reqs,
+                                rejected_head_dbg,
+                                tuple(sampled_token_ids.shape) if isinstance(sampled_token_ids, torch.Tensor) else (),
+                                qsl_head_dbg,
+                            )
+
+                if (
+                    num_reqs > 0
+                    and self._mtp_debug_counter % self._mtp_debug_log_interval == 0
+                ):
+                    draft_step1 = self._draft_token_ids[:num_reqs, 0]
+                    argmax_tokens = wrapper.main_next_token_ids_buf[:num_reqs]
+                    sampled_step0 = sampled_token_ids[:num_reqs, 0].to(argmax_tokens.dtype)
+                    argmax_sample_match = (argmax_tokens == sampled_step0).float().mean().item()
+                    # NOTE: draft_step1 predicts the *next* token after sampled next_token_ids.
+                    # Equality with next_token_ids is a temporal relation metric, not a correctness metric.
+                    step1_vs_sampled_next_equal = (
+                        draft_step1 == next_token_ids[:num_reqs].to(draft_step1.dtype)
+                    ).float().mean().item()
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] periodic path=fused reqs=%d step1_vs_sampled_next_equal=%.4f argmax_sample_match=%.4f",
+                        num_reqs,
+                        step1_vs_sampled_next_equal,
+                        argmax_sample_match,
+                    )
+                    if self._mtp_debug_level >= 2:
+                        draft_head = self._draft_token_ids[:num_reqs, :min(3, self._draft_token_ids.shape[1])].tolist()
+                        next_head = next_token_ids[:min(3, num_reqs)].tolist()
+                        logger.info("[MTP_FUSED_DEBUG] fused token summary reqs=%d draft_head=%s sampled_next_head=%s",
+                                    num_reqs, draft_head, next_head)
+                    if self._mtp_shadow_compare and not self._mtp_shadow_compare_disabled:
+                        shadow_interval = self._mtp_shadow_compare_interval or self._mtp_debug_log_interval
+                        should_shadow = (
+                            shadow_interval > 0
+                            and self._mtp_debug_counter % shadow_interval == 0
+                            and num_reqs <= self._mtp_shadow_compare_max_reqs
+                        )
+                        if should_shadow:
+                            try:
+                                # Keep token/index dtype aligned with proposer internals.
+                                shadow_sampled_token_ids = sampled_token_ids
+                                if (
+                                    isinstance(sampled_token_ids, torch.Tensor)
+                                    and sampled_token_ids.dtype != torch.int32
+                                ):
+                                    shadow_sampled_token_ids = sampled_token_ids.to(torch.int32)
+                                _meta_pre = None
+                                try:
+                                    fctx_pre = get_forward_context()
+                                    metas_pre = getattr(fctx_pre, "draft_attn_metadatas", None)
+                                    _meta_pre = (
+                                        id(getattr(fctx_pre, "attn_metadata", None)),
+                                        len(metas_pre) if metas_pre is not None else -1,
+                                        id(metas_pre[0]) if metas_pre else -1,
+                                        id(metas_pre[-1]) if metas_pre else -1,
+                                    )
+                                except Exception:
+                                    _meta_pre = None
+
+                                shadow_draft = self.propose_draft_token_ids(
+                                    shadow_sampled_token_ids,
+                                    self.input_batch.sampling_metadata,
+                                    scheduler_output,
+                                    spec_decode_metadata,
+                                    spec_decode_common_attn_metadata,
+                                    positions,
+                                    scheduler_output.total_num_scheduled_tokens,
+                                    hidden_states,
+                                    aux_hidden_states,
+                                    sample_hidden_states,
+                                    batch_desc,
+                                )
+
+                                _meta_post = None
+                                try:
+                                    fctx_post = get_forward_context()
+                                    metas_post = getattr(fctx_post, "draft_attn_metadatas", None)
+                                    _meta_post = (
+                                        id(getattr(fctx_post, "attn_metadata", None)),
+                                        len(metas_post) if metas_post is not None else -1,
+                                        id(metas_post[0]) if metas_post else -1,
+                                        id(metas_post[-1]) if metas_post else -1,
+                                    )
+                                except Exception:
+                                    _meta_post = None
+
+                                if self._mtp_debug_level >= 1 and (shadow_interval > 0 and self._mtp_debug_counter % shadow_interval == 0):
+                                    pre_active, pre_len, pre_first, pre_last = _meta_pre if _meta_pre is not None else (-1, -1, -1, -1)
+                                    post_active, post_len, post_first, post_last = _meta_post if _meta_post is not None else (-1, -1, -1, -1)
+                                    proposer_meta = getattr(self.drafter, "_last_graph_meta_status", None) if self.drafter is not None else None
+                                    p_has_meta = -1
+                                    p_meta_len = -1
+                                    p_active = -1
+                                    p_selected = -1
+                                    p_type = "None"
+                                    p_steps = -1
+                                    if isinstance(proposer_meta, dict):
+                                        p_has_meta = 1 if proposer_meta.get("has_meta", False) else 0
+                                        p_meta_len = int(proposer_meta.get("meta_len", -1))
+                                        p_active = int(proposer_meta.get("active_meta_id", -1))
+                                        p_selected = int(proposer_meta.get("selected_meta_id", -1))
+                                        p_type = str(proposer_meta.get("selected_meta_type", "None"))
+                                        p_steps = int(proposer_meta.get("total_steps", -1))
+                                    logger.info(
+                                        "[MTP_FUSED_DEBUG] shadow_meta_status pre_active=%d pre_len=%d pre_first=%d pre_last=%d post_active=%d post_len=%d post_first=%d post_last=%d proposer_has_meta=%d proposer_meta_len=%d proposer_active=%d proposer_selected=%d proposer_type=%s proposer_steps=%d",
+                                        pre_active,
+                                        pre_len,
+                                        pre_first,
+                                        pre_last,
+                                        post_active,
+                                        post_len,
+                                        post_first,
+                                        post_last,
+                                        p_has_meta,
+                                        p_meta_len,
+                                        p_active,
+                                        p_selected,
+                                        p_type,
+                                        p_steps,
+                                    )
+
+                                if isinstance(shadow_draft, torch.Tensor):
+                                    compare_k = min(
+                                        self._mtp_shadow_compare_max_tokens,
+                                        shadow_draft.shape[1],
+                                        self._draft_token_ids.shape[1],
+                                    )
+                                    fused_view = self._draft_token_ids[:num_reqs, :compare_k].to(shadow_draft.dtype)
+                                    shadow_view = shadow_draft[:num_reqs, :compare_k]
+                                    # Keep debug math on CPU to avoid adding extra aclNN ops in logging path.
+                                    fused_cpu = fused_view.detach().to("cpu")
+                                    shadow_cpu = shadow_view.detach().to("cpu")
+                                    eq_cpu = (fused_cpu == shadow_cpu)
+                                    eq_ratio = float(eq_cpu.float().mean().item())
+                                    mismatch = int((~eq_cpu).sum().item())
+                                    logger.info(
+                                        "[MTP_FUSED_DEBUG] shadow_compare reqs=%d tok=%d eq_ratio=%.4f mismatch=%d",
+                                        num_reqs,
+                                        compare_k,
+                                        eq_ratio,
+                                        mismatch,
+                                    )
+                                    if mismatch > 0 and self._mtp_debug_level >= 1:
+                                        idx = torch.nonzero(~eq_cpu, as_tuple=False)[:4]
+                                        idx_list = idx.tolist()
+                                        fused_vals = [int(fused_cpu[r, c].item()) for r, c in idx_list]
+                                        shadow_vals = [int(shadow_cpu[r, c].item()) for r, c in idx_list]
+                                        total_sched = int(sum(scheduler_output.num_scheduled_tokens.values()))
+                                        sampled_shape = tuple(sampled_token_ids.shape) if isinstance(sampled_token_ids, torch.Tensor) else ()
+                                        proposed_shape = tuple(shadow_draft.shape) if isinstance(shadow_draft, torch.Tensor) else ()
+                                        has_prefill = int(spec_decode_common_attn_metadata is not None and bool(getattr(spec_decode_common_attn_metadata, "num_prefill_reqs", 0)))
+                                        stage_snap = getattr(self, "_last_mtp_stage_snapshot", None)
+                                        logger.info(
+                                            "[MTP_FUSED_DEBUG] shadow_mismatch idx=%s fused=%s shadow=%s reqs=%d compare_k=%d sampled_shape=%s shadow_shape=%s total_sched=%d total_num_scheduled_tokens=%d has_prefill=%d stage_snapshot=%s",
+                                            idx_list,
+                                            fused_vals,
+                                            shadow_vals,
+                                            num_reqs,
+                                            compare_k,
+                                            sampled_shape,
+                                            proposed_shape,
+                                            total_sched,
+                                            int(scheduler_output.total_num_scheduled_tokens),
+                                            has_prefill,
+                                            str(stage_snap),
+                                        )
+
+                                        # Ask fused proposer to dump graph-internal state once on next call.
+                                        try:
+                                            # Force one-shot graph-internal debug on proposer.
+                                            if self.drafter is not None:
+                                                setattr(self.drafter, "_force_state_debug_once", True)
+                                        except Exception:
+                                            pass
+
+                                        # Snapshot key state only on first TP ranks to avoid log storms.
+                                        tp_rank = 0
+                                        try:
+                                            tp_rank = get_tp_group().rank_in_group
+                                        except Exception:
+                                            tp_rank = 0
+                                        if tp_rank < self._mtp_shadow_log_max_ranks:
+                                            li_buf = wrapper.logits_indices_buf[: max(1, num_reqs)]
+                                            li_head = li_buf[:4].detach().to("cpu").tolist()
+                                            li0 = int(li_buf[0].item()) if li_buf.numel() > 0 else -1
+                                            pos0 = int(positions[li0].item()) if (li0 >= 0 and li0 < positions.shape[0]) else -1
+                                            inid0 = int(self.input_ids.gpu[li0].item()) if (li0 >= 0 and li0 < self.input_ids.gpu.shape[0]) else -1
+                                            sampled0 = int(sampled_token_ids[0, 0].item()) if sampled_token_ids.numel() > 0 else -1
+                                            next0 = int(next_token_ids[0].item()) if next_token_ids.numel() > 0 else -1
+                                            vcnt0 = int(valid_sampled_tokens_count[0].item()) if valid_sampled_tokens_count.numel() > 0 else -1
+                                            qsl_head = []
+                                            expected_li0 = -1
+                                            num_draft0 = -1
+                                            rej0 = -1
+                                            try:
+                                                qsl = spec_decode_common_attn_metadata.query_start_loc
+                                                qsl_head = qsl[: min(4, qsl.shape[0])].detach().to("cpu").tolist()
+                                                if qsl.shape[0] >= 2:
+                                                    if spec_decode_metadata is not None:
+                                                        cu = spec_decode_metadata.cu_num_draft_tokens
+                                                        num_draft0 = int(cu[0].item()) if cu.numel() > 0 else 0
+                                                    else:
+                                                        num_draft0 = 0
+                                                    rej0 = max(0, num_draft0 + 1 - max(vcnt0, 0))
+                                                    expected_li0 = int(qsl[1].item()) - 1 - rej0
+                                            except Exception:
+                                                pass
+                                            logger.info(
+                                                "[MTP_FUSED_DEBUG] shadow_state tp_rank=%d li0=%d li_head=%s pos0=%d input_id0=%d sampled0=%d next0=%d valid_cnt0=%d num_draft0=%d rej0=%d expected_li0=%d qsl_head=%s",
+                                                tp_rank,
+                                                li0,
+                                                li_head,
+                                                pos0,
+                                                inid0,
+                                                sampled0,
+                                                next0,
+                                                vcnt0,
+                                                num_draft0,
+                                                rej0,
+                                                expected_li0,
+                                                qsl_head,
+                                            )
+                                            # Entry-side snapshot for fused graph mismatch triage.
+                                            in_head = self.input_ids.gpu[: min(8, self.input_ids.gpu.shape[0])].detach().to("cpu").tolist()
+                                            pos_head = positions[: min(8, positions.shape[0])].detach().to("cpu").tolist()
+                                            qsl_full_head = []
+                                            li_win = []
+                                            if spec_decode_common_attn_metadata is not None:
+                                                qsl_t = spec_decode_common_attn_metadata.query_start_loc
+                                                qsl_full_head = qsl_t[: min(8, qsl_t.shape[0])].detach().to("cpu").tolist()
+                                            li_win = wrapper.logits_indices_buf[: min(8, wrapper.logits_indices_buf.shape[0])].detach().to("cpu").tolist()
+                                            logger.info(
+                                                "[MTP_FUSED_DEBUG] shadow_entry_snapshot tp_rank=%d reqs=%d num_actual=%d total_sched=%d li0=%d expected_li0=%d input_ids_head=%s positions_head=%s qsl_head8=%s logits_idx_head8=%s",
+                                                tp_rank,
+                                                num_reqs,
+                                                scheduler_output.total_num_scheduled_tokens,
+                                                int(sum(scheduler_output.num_scheduled_tokens.values())),
+                                                li0,
+                                                expected_li0,
+                                                in_head,
+                                                pos_head,
+                                                qsl_full_head,
+                                                li_win,
+                                            )
+                                            draft_buf_head = fused_cpu[: min(1, fused_cpu.shape[0]), : min(4, fused_cpu.shape[1])].tolist()
+                                            shadow_buf_head = shadow_cpu[: min(1, shadow_cpu.shape[0]), : min(4, shadow_cpu.shape[1])].tolist()
+                                            logger.info(
+                                                "[MTP_FUSED_DEBUG] shadow_compare_buffers tp_rank=%d fused_buf_head=%s shadow_buf_head=%s sampled_shape=%s next_head=%s",
+                                                tp_rank,
+                                                draft_buf_head,
+                                                shadow_buf_head,
+                                                sampled_shape,
+                                                next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist() if isinstance(next_token_ids, torch.Tensor) else [],
+                                            )
+                                            if _meta_pre is not None or _meta_post is not None:
+                                                pre_active, pre_len, pre_first, pre_last = _meta_pre if _meta_pre is not None else (-1, -1, -1, -1)
+                                                post_active, post_len, post_first, post_last = _meta_post if _meta_post is not None else (-1, -1, -1, -1)
+                                                logger.info(
+                                                    "[MTP_FUSED_DEBUG] shadow_meta_snapshot tp_rank=%d pre_active=%d pre_len=%d pre_first=%d pre_last=%d post_active=%d post_len=%d post_first=%d post_last=%d drafter_id=%d wrapper_id=%d",
+                                                    tp_rank,
+                                                    pre_active,
+                                                    pre_len,
+                                                    pre_first,
+                                                    pre_last,
+                                                    post_active,
+                                                    post_len,
+                                                    post_first,
+                                                    post_last,
+                                                    id(self.drafter) if self.drafter is not None else -1,
+                                                    id(wrapper),
+                                                )
+                            except Exception as e:
+                                self._mtp_shadow_compare_err_count += 1
+                                self._mtp_shadow_compare_disabled = True
+                                logger.warning(
+                                    "[MTP_FUSED_DEBUG] disable shadow compare after error: %s (err_count=%d)",
+                                    repr(e),
+                                    self._mtp_shadow_compare_err_count,
+                                )
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                return
+
+            if not self._non_fused_mtp_path_logged:
+                logger.info("[MTP_FUSED_DEBUG] sample_tokens uses non-fused draft path")
+                self._non_fused_mtp_path_logged = True
             assert spec_decode_common_attn_metadata is not None
+            non_fused_sampled_token_ids = sampled_token_ids
+            if isinstance(sampled_token_ids, torch.Tensor) and sampled_token_ids.dtype != torch.int32:
+                non_fused_sampled_token_ids = sampled_token_ids.to(torch.int32)
             self._draft_token_ids = self.propose_draft_token_ids(
-                sampled_token_ids,
+                non_fused_sampled_token_ids,
                 self.input_batch.sampling_metadata,
                 scheduler_output,
                 spec_decode_metadata,
@@ -1556,6 +2118,10 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            self._mtp_debug_counter += 1
+            if self._mtp_debug_counter % self._mtp_debug_log_interval == 0:
+                logger.info("[MTP_FUSED_DEBUG] periodic path=non_fused reqs=%d",
+                            self.input_batch.num_reqs)
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -1714,6 +2280,18 @@ class NPUModelRunner(GPUModelRunner):
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                if self._mtp_debug_level >= 1 and sampled_token_ids.shape[0] == 1:
+                    try:
+                        sampled_head_dbg = sampled_token_ids[: min(1, sampled_token_ids.shape[0]), : min(4, sampled_token_ids.shape[1])].detach().to("cpu").tolist()
+                        valid_head_dbg = valid_sampled_token_ids[:1]
+                        logger.info(
+                            "[MTP_FUSED_DEBUG] sample_len1_bridge sampled_tensor_head=%s valid_list_head=%s discard_idx=%s",
+                            sampled_head_dbg,
+                            valid_head_dbg,
+                            discard_sampled_tokens_req_indices.detach().to("cpu").tolist() if hasattr(discard_sampled_tokens_req_indices, "detach") else list(discard_sampled_tokens_req_indices),
+                        )
+                    except Exception as e:
+                        logger.warning("[MTP_FUSED_DEBUG] sample_len1_bridge failed: %r", e)
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
@@ -1846,6 +2424,11 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_sparse
         ):
             assert positions is not None
+            draft_layer_names = None
+            if self._fused_mtp_wrapper is not None and self.drafter is not None:
+                draft_layer_names = getattr(self.drafter, 'attn_layer_names', None)
+                if draft_layer_names and forward_context.attn_metadata is not None:
+                    self._inject_mtp_metadata_stubs(forward_context)
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -1854,10 +2437,67 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
                 positions.shape[0],
+                draft_attn_layer_names=draft_layer_names,
             )
         if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
+
+    def _inject_mtp_metadata_stubs(self, forward_context):
+        """Prepare draft_attn_metadatas for MTP graph parameter update.
+
+        Do not mutate ``forward_context.attn_metadata`` in-place here:
+        DSA forward reads many fields (for example num_prefills/num_decodes),
+        and replacing per-layer metadata with stubs can break runtime.
+        """
+
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            per_layer_attn_metadata = {}
+            for layer_name in self.drafter.attn_layer_names:
+                layer_meta = attn_metadata.get(layer_name)
+                if layer_meta is not None:
+                    per_layer_attn_metadata[layer_name] = layer_meta
+            forward_context.draft_attn_metadatas = [per_layer_attn_metadata]
+        elif attn_metadata is not None:
+            forward_context.draft_attn_metadatas = [attn_metadata]
+        else:
+            forward_context.draft_attn_metadatas = None
+
+    def _run_drafter_dummy_and_inject_metadata(
+        self, num_tokens, num_reqs, num_tokens_across_dp,
+        cudagraph_runtime_mode, batch_desc, with_prefill, is_profile,
+    ):
+        """Run drafter.dummy_run to build MTP attn_metadata, then extract
+        the step-0 per-layer metadata and inject it into the main model's
+        forward_context so that MTP attention ops are captured into the
+        main graph."""
+        drafter = self.drafter
+
+        drafter.dummy_run(
+            num_tokens=num_tokens,
+            with_prefill=with_prefill,
+            num_reqs=num_reqs,
+            num_tokens_across_dp=num_tokens_across_dp,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_desc,
+            dummy_compute_logits=lambda hidden_states: None,
+            in_graph_capturing=True,
+            is_profile=is_profile,
+        )
+
+        saved_metadata = getattr(drafter, '_last_dummy_attn_metadata', None)
+        forward_context = get_forward_context()
+        if forward_context is not None:
+            if saved_metadata and len(saved_metadata) > 0:
+                if isinstance(forward_context.attn_metadata, dict):
+                    for layer_name, meta in saved_metadata[0].items():
+                        forward_context.attn_metadata[layer_name] = meta
+                forward_context.draft_attn_metadatas = saved_metadata
+            else:
+                # Fallback: keep fused proposer metadata-visible even when
+                # drafter dummy path does not populate _last_dummy_attn_metadata.
+                self._inject_mtp_metadata_stubs(forward_context)
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
@@ -2565,6 +3205,17 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 input_ids=input_ids,
             ):
+                if (
+                    self._fused_mtp_wrapper is not None
+                    and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    and self.drafter is not None
+                    and hasattr(self.drafter, 'draft_attn_groups')
+                    and len(self.drafter.draft_attn_groups) > 0
+                ):
+                    self._run_drafter_dummy_and_inject_metadata(
+                        num_tokens_padded, num_reqs_padded, num_tokens_across_dp,
+                        cudagraph_runtime_mode, batch_desc, with_prefill, is_profile)
+
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
@@ -2575,17 +3226,20 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter:
-                self.drafter.dummy_run(
-                    num_tokens=num_tokens_padded,
-                    with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    aclgraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
-                    dummy_compute_logits=dummy_drafter_compute_logits,
-                    in_graph_capturing=not force_attention,
-                    is_profile=is_profile,
-                )
+                if self._fused_mtp_wrapper is not None and not is_profile:
+                    dummy_drafter_compute_logits(hidden_states)
+                else:
+                    self.drafter.dummy_run(
+                        num_tokens=num_tokens_padded,
+                        with_prefill=with_prefill,
+                        num_reqs=num_reqs_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        aclgraph_runtime_mode=cudagraph_runtime_mode,
+                        batch_descriptor=batch_desc,
+                        dummy_compute_logits=dummy_drafter_compute_logits,
+                        in_graph_capturing=not force_attention,
+                        is_profile=is_profile,
+                    )
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
             if self.dynamic_eplb:
@@ -2652,6 +3306,19 @@ class NPUModelRunner(GPUModelRunner):
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
+                # NOTE:
+                # Stopgap policy:
+                # - Keep fused MTP disabled by default for correctness.
+                # - Allow explicit opt-in via env VLLM_ASCEND_ENABLE_MTP_FUSED=1.
+                should_fuse_mtp = bool(self._fused_mtp_force_enable)
+                logger.info("[MTP_FUSED_DEBUG] should_fuse_mtp=%s force_enable=%s method=%s full_graph=%s pp_last_rank=%s",
+                            should_fuse_mtp,
+                            self._fused_mtp_force_enable,
+                            self.speculative_config.method if self.speculative_config is not None else None,
+                            self.compilation_config.cudagraph_mode.has_full_cudagraphs(),
+                            get_pp_group().is_last_rank)
+                if should_fuse_mtp:
+                    self.drafter.fused_with_main_graph = True
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
                 if self.use_aux_hidden_state_outputs:
@@ -2672,7 +3339,23 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            runnable = self.model
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.drafter is not None
+                and isinstance(self.drafter, AscendEagleProposer)
+                and get_pp_group().is_last_rank
+                and getattr(self.drafter, "fused_with_main_graph", False)
+            ):
+                self._fused_mtp_wrapper = _FusedModelWithMTP(self.model, self.drafter)
+                runnable = self._fused_mtp_wrapper
+                self.drafter.update_stream = self.update_stream
+                logger.info("[MTP_FUSED_DEBUG] fused wrapper enabled for runnable=%s", type(runnable).__name__)
+            else:
+                logger.info("[MTP_FUSED_DEBUG] fused wrapper disabled, using runnable=%s", type(runnable).__name__)
+                self._fused_mtp_wrapper = None
+            self.model = ACLGraphWrapper(runnable, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
