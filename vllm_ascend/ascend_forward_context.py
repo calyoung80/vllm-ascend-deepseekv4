@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -8,6 +9,7 @@ import vllm.envs as envs_vllm
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
+from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import (
@@ -22,6 +24,25 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
+
+
+
+def _mtp_meta_chain_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MTP_META_CHAIN_TRACE", "0") == "1"
+
+
+def _mtp_meta_chain_summary(metas) -> str:
+    if metas is None:
+        return "len=-1 first=-1 last=-1 layers=-1"
+    if not isinstance(metas, list):
+        return f"type={type(metas).__name__}"
+    meta_len = len(metas)
+    if meta_len == 0:
+        return "len=0 first=-1 last=-1 layers=-1"
+    first = metas[0]
+    last = metas[-1]
+    layer_count = len(first) if isinstance(first, dict) else -1
+    return f"len={meta_len} first={id(first)} last={id(last)} layers={layer_count}"
 
 class MoECommType(Enum):
     ALLGATHER = 0
@@ -66,7 +87,17 @@ def set_ascend_forward_context(
 
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] set_ctx_arg %s",
+                _mtp_meta_chain_summary(draft_attn_metadatas),
+            )
         forward_context.draft_attn_metadatas = draft_attn_metadatas
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] set_ctx_live %s",
+                _mtp_meta_chain_summary(getattr(forward_context, "draft_attn_metadatas", None)),
+            )
 
         forward_context.input_ids = input_ids
 
@@ -152,6 +183,7 @@ def set_ascend_forward_context(
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
+            forward_context.num_actual_tokens = num_actual_tokens
             # NOTE: token num which need to pad to when mc2
             forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()

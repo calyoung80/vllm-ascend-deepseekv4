@@ -40,6 +40,26 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
+
+
+def _mtp_meta_chain_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MTP_META_CHAIN_TRACE", "0") == "1"
+
+
+def _mtp_meta_chain_summary(metas) -> str:
+    if metas is None:
+        return "len=-1 first=-1 last=-1 layers=-1"
+    if not isinstance(metas, list):
+        return f"type={type(metas).__name__}"
+    meta_len = len(metas)
+    if meta_len == 0:
+        return "len=0 first=-1 last=-1 layers=-1"
+    first = metas[0]
+    last = metas[-1]
+    layer_count = len(first) if isinstance(first, dict) else -1
+    return (
+        f"len={meta_len} first={id(first)} last={id(last)} layers={layer_count}"
+    )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
@@ -459,6 +479,12 @@ class NPUModelRunner(GPUModelRunner):
         self._mtp_debug_level = int(os.getenv("VLLM_ASCEND_MTP_DEBUG_LEVEL", "1"))
         self._mtp_fallback_b1 = os.getenv("VLLM_ASCEND_MTP_FALLBACK_B1", "1") == "1"
         self._mtp_fallback_b2 = os.getenv("VLLM_ASCEND_MTP_FALLBACK_B2", "1") == "1"
+        self._mtp_postsample_rejection_correction = (
+            os.getenv("VLLM_ASCEND_MTP_POSTSAMPLE_REJECTION_CORRECTION", "1") == "1"
+        )
+        self._mtp_correction_also_on_zero_reject = (
+            os.getenv("VLLM_ASCEND_MTP_CORRECTION_ON_ZERO_REJECT", "0") == "1"
+        )
         self._mtp_forward_debug_counter = 0
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
@@ -1017,6 +1043,96 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices=logits_indices,
         )
 
+    def _propose_eagle_from_sampled_state(
+        self,
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata,
+        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None,
+        target_model_batch_desc: BatchDescriptor,
+        next_token_ids: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor | None,
+    ) -> torch.Tensor:
+        common_attn_metadata = spec_decode_common_attn_metadata
+        # The correction path should not mutate the shared speculative
+        # attention metadata in-place before the later shadow/reference path
+        # runs. Reuse the proposer-side shallow copy contract so prepare_* can
+        # rewrite metadata fields without feeding back into the caller.
+        if self.drafter is not None and hasattr(self.drafter, "shallow_copy_metadata"):
+            common_attn_metadata = self.drafter.shallow_copy_metadata(
+                common_attn_metadata)
+        req_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.use_cp:
+            long_seq_metadata = self.long_seq_metadata  # type: ignore
+            input_ids_pcp_full = self.pcp_manager.input_ids_pcp_full.gpu
+            query_start_loc_pcp_full = self.pcp_manager.query_start_loc_pcp_full.gpu
+            query_start_loc_pcp_full_cpu = self.pcp_manager.query_start_loc_pcp_full.cpu
+            num_reqs = self.input_batch.num_reqs
+            num_prefill_reqs = self.pcp_manager.num_prefill_reqs
+            num_decode_reqs = self.pcp_manager.num_decode_reqs
+        else:
+            long_seq_metadata = None  # type: ignore
+            num_prefill_reqs = 0
+            num_decode_reqs = 0
+
+        num_rejected_tokens_gpu = None
+        if self.pcp_size > 1:
+            assert common_attn_metadata is not None
+            common_attn_metadata.query_start_loc_cpu[: num_reqs + 1] = query_start_loc_pcp_full_cpu[: num_reqs + 1]
+            common_attn_metadata.query_start_loc[: num_reqs + 1] = query_start_loc_pcp_full[: num_reqs + 1]
+
+        if self.vllm_config.speculative_config.disable_padded_drafter_batch:
+            token_indices_to_sample = None
+            assert self.drafter is not None
+            common_attn_metadata, token_indices = self.drafter.prepare_inputs(
+                common_attn_metadata, sampled_token_ids, spec_decode_metadata.num_draft_tokens
+            )
+        else:
+            assert valid_sampled_tokens_count is not None
+            assert self.drafter is not None
+            common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = self.drafter.prepare_inputs_padded(
+                common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+            )
+
+        if self.pcp_size > 1:
+            target_token_ids = input_ids_pcp_full[token_indices]
+            target_positions = positions
+            target_hidden_states = hidden_states
+            if self.use_aux_hidden_state_outputs:
+                assert aux_hidden_states is not None
+                target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+        else:
+            target_token_ids = self.input_ids.gpu[token_indices]
+            target_positions = self._get_positions(token_indices)
+            if self.use_aux_hidden_state_outputs:
+                assert aux_hidden_states is not None
+                target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
+            else:
+                target_hidden_states = hidden_states[token_indices]
+
+        assert self.drafter is not None
+        return self.drafter._propose(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            common_attn_metadata=common_attn_metadata,
+            target_model_batch_desc=target_model_batch_desc,
+            sampling_metadata=sampling_metadata,
+            req_scheduled_tokens=req_scheduled_tokens,
+            long_seq_metadata=long_seq_metadata,
+            num_prefill_reqs=num_prefill_reqs,
+            num_decode_reqs=num_decode_reqs,
+            scheduler_output=scheduler_output,
+            num_scheduled_tokens=int(sum(scheduler_output.num_scheduled_tokens.values())),
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
@@ -1044,6 +1160,7 @@ class NPUModelRunner(GPUModelRunner):
             "next_token_head": [],
             "token_indices_head": [],
             "token_indices_dtype": "",
+            "num_rejected_head": [],
             "qsl_head": [],
         }
         if not self.drafter:
@@ -1166,6 +1283,8 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(token_indices_to_sample, torch.Tensor):
                     stage_snapshot["token_indices_head"] = token_indices_to_sample[: min(8, token_indices_to_sample.shape[0])].detach().to("cpu").tolist()
                     stage_snapshot["token_indices_dtype"] = str(token_indices_to_sample.dtype)
+                if isinstance(num_rejected_tokens_gpu, torch.Tensor):
+                    stage_snapshot["num_rejected_head"] = num_rejected_tokens_gpu[: min(8, num_rejected_tokens_gpu.shape[0])].detach().to("cpu").tolist()
                 if spec_decode_common_attn_metadata is not None and getattr(spec_decode_common_attn_metadata, "query_start_loc", None) is not None:
                     qsl = spec_decode_common_attn_metadata.query_start_loc
                     stage_snapshot["qsl_head"] = qsl[: min(8, qsl.shape[0])].detach().to("cpu").tolist()
@@ -1439,6 +1558,16 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        draft_attn_metadatas_ctx = (
+            getattr(self.drafter, "_last_dummy_attn_metadata", None)
+            if self._fused_mtp_wrapper is not None and self.drafter is not None
+            else None
+        )
+        if _mtp_meta_chain_enabled() and self._fused_mtp_wrapper is not None:
+            logger.info(
+                "[MTP_META_CHAIN] execute_context_arg %s",
+                _mtp_meta_chain_summary(draft_attn_metadatas_ctx),
+            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -1453,7 +1582,7 @@ class NPUModelRunner(GPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
                 input_ids=input_ids,
-                draft_attn_metadatas=(getattr(self.drafter, "_last_dummy_attn_metadata", None) if self._fused_mtp_wrapper is not None and self.drafter is not None else None),
+                draft_attn_metadatas=draft_attn_metadatas_ctx,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1462,6 +1591,11 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if _mtp_meta_chain_enabled() and self._fused_mtp_wrapper is not None:
+                logger.info(
+                    "[MTP_META_CHAIN] execute_context_live %s",
+                    _mtp_meta_chain_summary(getattr(get_forward_context(), "draft_attn_metadatas", None)),
+                )
             if self._fused_mtp_wrapper is not None:
                 buf = self._fused_mtp_wrapper.logits_indices_buf
                 idx_len = logits_indices.shape[0]
@@ -1744,6 +1878,7 @@ class NPUModelRunner(GPUModelRunner):
                 # If this round rejected any speculative token, recompute once
                 # with non-fused semantics and overwrite the stale draft buffer.
                 needs_rejection_correction = False
+                correction_reason = "none"
                 rejected_head_dbg = []
                 try:
                     cu_num_draft_tokens = getattr(spec_decode_metadata, "cu_num_draft_tokens", None)
@@ -1761,9 +1896,19 @@ class NPUModelRunner(GPUModelRunner):
                             torch.zeros_like(num_draft_tokens_gpu),
                         )
                         rejected_head_dbg = num_rejected_tokens_gpu[: min(4, num_rejected_tokens_gpu.shape[0])].detach().to("cpu").tolist()
-                        needs_rejection_correction = bool(torch.any(num_rejected_tokens_gpu > 0).item())
+                        has_reject = bool(torch.any(num_rejected_tokens_gpu > 0).item())
+                        needs_rejection_correction = (
+                            self._mtp_postsample_rejection_correction
+                            and (
+                                has_reject
+                                or self._mtp_correction_also_on_zero_reject
+                            )
+                        )
+                        if needs_rejection_correction:
+                            correction_reason = "reject" if has_reject else "zero_reject"
                 except Exception:
                     needs_rejection_correction = False
+                    correction_reason = "none"
                     rejected_head_dbg = []
 
                 if self._mtp_debug_level >= 1 and num_reqs == 1:
@@ -1786,10 +1931,16 @@ class NPUModelRunner(GPUModelRunner):
                     except Exception as e:
                         logger.warning("[MTP_FUSED_DEBUG] fused_branch_probe failed: %r", e)
 
+                shadow_compare_override = None
                 if force_non_fused_req1 or needs_rejection_correction:
                     shadow_sampled_token_ids = sampled_token_ids
                     if isinstance(sampled_token_ids, torch.Tensor) and sampled_token_ids.dtype != torch.int32:
                         shadow_sampled_token_ids = sampled_token_ids.to(torch.int32)
+                    # Keep the correction path byte-for-byte aligned with the
+                    # standard proposer path used by the shadow/reference
+                    # compare. If residual mismatches remain after this, they
+                    # are no longer attributable to a helper-only semantic
+                    # divergence.
                     shadow_draft = self.propose_draft_token_ids(
                         shadow_sampled_token_ids,
                         self.input_batch.sampling_metadata,
@@ -1797,14 +1948,33 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_metadata,
                         spec_decode_common_attn_metadata,
                         positions,
-                        scheduler_output.total_num_scheduled_tokens,
+                        int(sum(scheduler_output.num_scheduled_tokens.values())),
                         hidden_states,
-                        aux_hidden_states,
-                        sample_hidden_states,
-                        batch_desc,
+                        aux_hidden_states=aux_hidden_states,
+                        sample_hidden_states=sample_hidden_states,
+                        target_model_batch_desc=batch_desc,
                     )
                     if isinstance(shadow_draft, torch.Tensor):
-                        self._draft_token_ids[:num_reqs, :shadow_draft.shape[1]] = shadow_draft[:num_reqs]
+                        # Experimental tail-live-graph mode: preserve the
+                        # current fused step0 and only replace later draft
+                        # steps with the post-sample compact tail result.
+                        if (
+                            getattr(self.drafter, "_tail_live_graph_enabled", False)
+                            and self._draft_token_ids.shape[1] > 1
+                            and shadow_draft.shape[1] > 1
+                        ):
+                            self._draft_token_ids[:num_reqs, 1:shadow_draft.shape[1]] = (
+                                shadow_draft[:num_reqs, 1:shadow_draft.shape[1]]
+                            )
+                            shadow_compare_override = self._draft_token_ids[:num_reqs].clone()
+                            logger.info(
+                                "[MTP_FUSED_DEBUG] tail_live_graph_tail_only applied reqs=%d keep_step0=1 replace_cols=%d",
+                                num_reqs,
+                                int(max(shadow_draft.shape[1] - 1, 0)),
+                            )
+                        else:
+                            self._draft_token_ids[:num_reqs, :shadow_draft.shape[1]] = shadow_draft[:num_reqs]
+                            shadow_compare_override = shadow_draft.clone()
                         if force_non_fused_req1:
                             logger.info(
                                 "[MTP_FUSED_DEBUG] minimal_fallback_non_fused applied branch=%s reqs=%d sampled_shape=%s qsl_head=%s",
@@ -1815,8 +1985,9 @@ class NPUModelRunner(GPUModelRunner):
                             )
                         elif needs_rejection_correction:
                             logger.info(
-                                "[MTP_FUSED_DEBUG] postsample_rejection_correction applied reqs=%d rejected_head=%s sampled_shape=%s qsl_head=%s",
+                                "[MTP_FUSED_DEBUG] postsample_rejection_correction applied reqs=%d reason=%s rejected_head=%s sampled_shape=%s qsl_head=%s",
                                 num_reqs,
+                                correction_reason,
                                 rejected_head_dbg,
                                 tuple(sampled_token_ids.shape) if isinstance(sampled_token_ids, torch.Tensor) else (),
                                 qsl_head_dbg,
@@ -1875,19 +2046,22 @@ class NPUModelRunner(GPUModelRunner):
                                 except Exception:
                                     _meta_pre = None
 
-                                shadow_draft = self.propose_draft_token_ids(
-                                    shadow_sampled_token_ids,
-                                    self.input_batch.sampling_metadata,
-                                    scheduler_output,
-                                    spec_decode_metadata,
-                                    spec_decode_common_attn_metadata,
-                                    positions,
-                                    scheduler_output.total_num_scheduled_tokens,
-                                    hidden_states,
-                                    aux_hidden_states,
-                                    sample_hidden_states,
-                                    batch_desc,
-                                )
+                                if isinstance(shadow_compare_override, torch.Tensor):
+                                    shadow_draft = shadow_compare_override
+                                else:
+                                    shadow_draft = self.propose_draft_token_ids(
+                                        shadow_sampled_token_ids,
+                                        self.input_batch.sampling_metadata,
+                                        scheduler_output,
+                                        spec_decode_metadata,
+                                        spec_decode_common_attn_metadata,
+                                        positions,
+                                        scheduler_output.total_num_scheduled_tokens,
+                                        hidden_states,
+                                        aux_hidden_states,
+                                        sample_hidden_states,
+                                        batch_desc,
+                                    )
 
                                 _meta_post = None
                                 try:
@@ -2070,6 +2244,37 @@ class NPUModelRunner(GPUModelRunner):
                                                 sampled_shape,
                                                 next_token_ids[: min(4, next_token_ids.shape[0])].detach().to("cpu").tolist() if isinstance(next_token_ids, torch.Tensor) else [],
                                             )
+                                            if _mtp_meta_chain_enabled() and self.drafter is not None:
+                                                cap_snaps = getattr(self.drafter, "_capture_multistep_snapshot", None)
+                                                if isinstance(cap_snaps, list):
+                                                    for snap in cap_snaps[: min(4, len(cap_snaps))]:
+                                                        try:
+                                                            logger.info(
+                                                                "[MTP_META_CHAIN] mismatch_step%d input_head=%s pos_head=%s sample_idx_head=%s draft_head=%s meta_len=%d selected_meta_id=%d",
+                                                                int(snap.get("step", -1)),
+                                                                snap["input_head"].detach().to("cpu").tolist(),
+                                                                snap["pos_head"].detach().to("cpu").tolist(),
+                                                                snap["sample_idx_head"].detach().to("cpu").tolist(),
+                                                                snap["draft_head"].detach().to("cpu").tolist(),
+                                                                int(snap.get("meta_len", -1)),
+                                                                int(snap.get("selected_meta_id", -1)),
+                                                            )
+                                                        except Exception as _e:
+                                                            logger.warning("[MTP_META_CHAIN] mismatch_step snapshot flush failed: %s", repr(_e))
+                                                shadow_snaps = getattr(self.drafter, "_shadow_multistep_snapshot", None)
+                                                if isinstance(shadow_snaps, list):
+                                                    for snap in shadow_snaps[: min(4, len(shadow_snaps))]:
+                                                        try:
+                                                            logger.info(
+                                                                "[MTP_META_CHAIN] shadow_step%d input_head=%s pos_head=%s sample_idx_head=%s draft_head=%s",
+                                                                int(snap.get("step", -1)),
+                                                                snap["input_head"].detach().to("cpu").tolist(),
+                                                                snap["pos_head"].detach().to("cpu").tolist(),
+                                                                snap["sample_idx_head"].detach().to("cpu").tolist(),
+                                                                snap["draft_head"].detach().to("cpu").tolist(),
+                                                            )
+                                                        except Exception as _e:
+                                                            logger.warning("[MTP_META_CHAIN] shadow_step snapshot flush failed: %s", repr(_e))
                                             if _meta_pre is not None or _meta_post is not None:
                                                 pre_active, pre_len, pre_first, pre_last = _meta_pre if _meta_pre is not None else (-1, -1, -1, -1)
                                                 post_active, post_len, post_first, post_last = _meta_post if _meta_post is not None else (-1, -1, -1, -1)
@@ -2449,7 +2654,25 @@ class NPUModelRunner(GPUModelRunner):
         Do not mutate ``forward_context.attn_metadata`` in-place here:
         DSA forward reads many fields (for example num_prefills/num_decodes),
         and replacing per-layer metadata with stubs can break runtime.
+
+        Preserve an existing multi-step metadata list. The fused proposer
+        consumes one entry per speculative step at runtime; only synthesize a
+        single-step fallback when the full list is absent.
         """
+
+        existing = getattr(forward_context, "draft_attn_metadatas", None)
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] stub_entry %s",
+                _mtp_meta_chain_summary(existing),
+            )
+        if isinstance(existing, list) and len(existing) > 1:
+            if _mtp_meta_chain_enabled():
+                logger.info(
+                    "[MTP_META_CHAIN] stub_preserve %s",
+                    _mtp_meta_chain_summary(existing),
+                )
+            return
 
         attn_metadata = forward_context.attn_metadata
         if isinstance(attn_metadata, dict):
@@ -2463,6 +2686,11 @@ class NPUModelRunner(GPUModelRunner):
             forward_context.draft_attn_metadatas = [attn_metadata]
         else:
             forward_context.draft_attn_metadatas = None
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] stub_exit %s",
+                _mtp_meta_chain_summary(getattr(forward_context, "draft_attn_metadatas", None)),
+            )
 
     def _run_drafter_dummy_and_inject_metadata(
         self, num_tokens, num_reqs, num_tokens_across_dp,
@@ -2487,6 +2715,11 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         saved_metadata = getattr(drafter, '_last_dummy_attn_metadata', None)
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] inject_saved %s",
+                _mtp_meta_chain_summary(saved_metadata),
+            )
         forward_context = get_forward_context()
         if forward_context is not None:
             if saved_metadata and len(saved_metadata) > 0:
@@ -2494,6 +2727,11 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name, meta in saved_metadata[0].items():
                         forward_context.attn_metadata[layer_name] = meta
                 forward_context.draft_attn_metadatas = saved_metadata
+                if _mtp_meta_chain_enabled():
+                    logger.info(
+                        "[MTP_META_CHAIN] inject_assigned %s",
+                        _mtp_meta_chain_summary(getattr(forward_context, "draft_attn_metadatas", None)),
+                    )
             else:
                 # Fallback: keep fused proposer metadata-visible even when
                 # drafter dummy path does not populate _last_dummy_attn_metadata.
@@ -3199,7 +3437,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
                 in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
+                num_actual_tokens=num_tokens_unpadded,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,

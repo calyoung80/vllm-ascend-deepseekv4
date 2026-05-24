@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import inspect
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -21,6 +23,26 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
+
+
+def _mtp_meta_chain_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MTP_META_CHAIN_TRACE", "0") == "1"
+
+
+def _mtp_meta_chain_summary(metas) -> str:
+    if metas is None:
+        return "len=-1 first=-1 last=-1 layers=-1"
+    if not isinstance(metas, list):
+        return f"type={type(metas).__name__}"
+    meta_len = len(metas)
+    if meta_len == 0:
+        return "len=0 first=-1 last=-1 layers=-1"
+    first = metas[0]
+    last = metas[-1]
+    layer_count = len(first) if isinstance(first, dict) else -1
+    return (
+        f"len={meta_len} first={id(first)} last={id(last)} layers={layer_count}"
+    )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
@@ -52,6 +74,16 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+
+
+@dataclass
+class TailLiveState:
+    step0_draft_token_ids: torch.Tensor
+    live_token_indices_to_sample: torch.Tensor
+    live_positions: torch.Tensor
+    live_hidden_states: torch.Tensor
+    state_batch_size: int
+    sample_batch_size: int
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -143,7 +175,8 @@ class _FusedModelWithMTP:
         
         num_tokens_dbg = input_ids.shape[0]
         num_spec_dbg = self.drafter.num_speculative_tokens
-        batch_size_dbg = max(num_tokens_dbg // (num_spec_dbg + 1), 1)
+        num_actual_tokens_dbg = int(getattr(forward_context, "num_actual_tokens", num_tokens_dbg))
+        batch_size_dbg = max(num_actual_tokens_dbg // (num_spec_dbg + 1), 1)
         cudagraph_mode_dbg = str(getattr(forward_context, 'cudagraph_runtime_mode', 'NONE'))
         
         # Capture-safe entry log: only print shapes in capture mode, no CPU sync
@@ -173,7 +206,8 @@ class _FusedModelWithMTP:
                     raw_hidden = raw_hidden[:-pad_size, :]
             num_tokens = input_ids.shape[0]
             num_spec = self.drafter.num_speculative_tokens
-            batch_size = max(num_tokens // (num_spec + 1), 1)
+            num_actual_tokens = int(getattr(forward_context, "num_actual_tokens", num_tokens))
+            batch_size = max(num_actual_tokens // (num_spec + 1), 1)
             if emit_wrapper_debug and (not is_capturing) and batch_size == 1:
                 try:
                     li_dbg = self.logits_indices_buf[: min(4, self.logits_indices_buf.shape[0])].detach().to("cpu").tolist()
@@ -308,6 +342,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         ]
 
         self._runnable = self._run_merged_draft
+        self._tail_live_runnable = self._run_compact_tail_live_draft
         self.query_lens = torch.ones(
             self.vllm_config.scheduler_config.max_num_seqs,
             dtype=torch.int32,
@@ -327,6 +362,18 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=device)
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
+
+        # Experimental compact tail-live graph is currently unstable on the
+        # deployed stack (rotary dim0 mismatch). Force-disable to keep runtime
+        # correctness while preserving code paths for future re-enable.
+        _tail_live_graph_requested = (
+            os.getenv("VLLM_ASCEND_MTP_TAIL_LIVE_GRAPH", "0") == "1")
+        if _tail_live_graph_requested:
+            logger.warning(
+                "[MTP_FUSED_DEBUG] VLLM_ASCEND_MTP_TAIL_LIVE_GRAPH is temporarily disabled due to rotary dim0 mismatch"
+            )
+        self._tail_live_graph_enabled = False
+        self._tail_live_graph_path_logged = False
 
         # NPU aclnnIndexPutImpl in fused MTP path requires int64 self tensor.
         if self.method == "mtp" and hasattr(self, "input_ids") and self.input_ids.dtype != torch.int64:
@@ -535,7 +582,9 @@ class SpecDecodeBaseProposer(EagleProposer):
         plus all N MTP steps are recorded/replayed as a **single** graph.
         Returns ``draft_token_ids`` of shape ``(batch_size, num_speculative_tokens)``.
         """
-        batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        forward_context = get_forward_context()
+        num_actual_tokens = int(getattr(forward_context, "num_actual_tokens", num_tokens))
+        batch_size = max(num_actual_tokens // (self.num_speculative_tokens + 1), 1)
         raw_model = self.get_model()
 
         # Defensive init for debug attrs: some deployments may load proposer
@@ -561,7 +610,6 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         # Never do debug scalar/tensor reads in graph-capturing phase.
         # Ascend forbids stream synchronize on captured stream.
-        forward_context = get_forward_context()
         in_capture = bool(getattr(forward_context, "capturing", False))
         if in_capture:
             if self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
@@ -732,6 +780,20 @@ class SpecDecodeBaseProposer(EagleProposer):
             self._force_state_debug_once = False
         logits = raw_model.compute_logits(sample_hs)
         draft_token_ids = logits.argmax(dim=-1)
+        forward_context = get_forward_context()
+        draft_attn_metadatas = getattr(
+            forward_context, 'draft_attn_metadatas', None)
+        capture_step_snapshots = [] if (in_capture and _mtp_meta_chain_enabled()) else None
+        if capture_step_snapshots is not None:
+            capture_step_snapshots.append({
+                "step": 0,
+                "input_head": work_input_ids[: min(4, work_input_ids.shape[0])].clone(),
+                "pos_head": positions[: min(4, positions.shape[0])].clone(),
+                "sample_idx_head": step0_logits_indices[: min(4, step0_logits_indices.shape[0])].clone(),
+                "draft_head": draft_token_ids[: min(4, draft_token_ids.shape[0])].clone(),
+                "meta_len": len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1,
+                "selected_meta_id": id(draft_attn_metadatas[0]) if draft_attn_metadatas and len(draft_attn_metadatas) > 0 else -1,
+            })
         if do_state_debug:
             try:
                 vocab_n = min(4, logits.shape[-1]) if logits.ndim > 1 else 0
@@ -780,9 +842,11 @@ class SpecDecodeBaseProposer(EagleProposer):
             except Exception as _e:
                 logger.warning("[MTP_FUSED_DEBUG] draft_zero_sentinel failed: %s", repr(_e))
 
-        forward_context = get_forward_context()
-        draft_attn_metadatas = getattr(
-            forward_context, 'draft_attn_metadatas', None)
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] proposer_entry %s",
+                _mtp_meta_chain_summary(draft_attn_metadatas),
+            )
 
         has_meta_dbg = bool(draft_attn_metadatas)
         meta_len_dbg = len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1
@@ -833,14 +897,12 @@ class SpecDecodeBaseProposer(EagleProposer):
                     )
             return draft_token_ids.view(-1, 1)
 
-        draft_token_ids_tensor = torch.zeros(
-            (self.num_speculative_tokens, *draft_token_ids.shape),
-            dtype=draft_token_ids.dtype, device=self.device)
-        draft_token_ids_tensor[0] = draft_token_ids
-
-        step_positions = self.positions[logits_indices[:batch_size]]
-        step_hidden_states = hidden_states_out[logits_indices[:batch_size]]
-        token_indices_to_sample = self.arange[:batch_size]
+        tail_state = self._build_fused_tail_runtime_state(
+            step0_draft_token_ids=draft_token_ids,
+            step0_logits_indices=step0_logits_indices,
+            hidden_states_out=hidden_states_out,
+            live_batch_size=batch_size,
+        )
 
         # Ensure draft step-0 uses drafter metadata instead of main-model metadata.
         if draft_attn_metadatas and len(draft_attn_metadatas) > 0:
@@ -856,6 +918,132 @@ class SpecDecodeBaseProposer(EagleProposer):
                     type(getattr(forward_context, "attn_metadata", None)).__name__,
                 )
 
+        draft_token_ids_tensor, capture_step_snapshots = (
+            self._run_fused_tail_steps(
+                raw_model=raw_model,
+                forward_context=forward_context,
+                draft_attn_metadatas=draft_attn_metadatas,
+                tail_state=tail_state,
+                num_tokens=num_tokens,
+                work_input_ids=work_input_ids,
+                do_state_debug=do_state_debug,
+                capture_step_snapshots=capture_step_snapshots,
+            ))
+
+        if capture_step_snapshots is not None:
+            self._capture_multistep_snapshot = capture_step_snapshots
+        return draft_token_ids_tensor.swapaxes(0, 1)
+
+    def _build_fused_tail_state(
+        self,
+        step0_draft_token_ids: torch.Tensor,
+        step0_logits_indices: torch.Tensor,
+        hidden_states_out: torch.Tensor,
+    ) -> TailLiveState:
+        # Preserve the current fused behavior: later steps inherit all lanes
+        # addressed by step0_logits_indices, not just the business-level live
+        # request count. A later tail live-lane graph will intentionally
+        # replace this with compact live-lane state construction.
+        step_batch_size = int(step0_logits_indices.shape[0])
+        return self._make_tail_live_state(
+            step0_draft_token_ids=step0_draft_token_ids,
+            live_token_indices_to_sample=self.arange[:step_batch_size],
+            live_positions=self.positions[step0_logits_indices],
+            live_hidden_states=hidden_states_out[step0_logits_indices],
+            state_batch_size=step_batch_size,
+            sample_batch_size=step_batch_size,
+        )
+
+    def _build_fused_tail_runtime_state(
+        self,
+        step0_draft_token_ids: torch.Tensor,
+        step0_logits_indices: torch.Tensor,
+        hidden_states_out: torch.Tensor,
+        live_batch_size: int,
+    ) -> TailLiveState:
+        if getattr(self, "_tail_live_graph_enabled", False):
+            if not getattr(self, "_tail_live_graph_path_logged", False):
+                logger.info(
+                    "[MTP_FUSED_DEBUG] fused tail runtime selects compact live-lane state"
+                )
+                self._tail_live_graph_path_logged = True
+            return self._build_compact_tail_live_state(
+                step0_draft_token_ids=step0_draft_token_ids,
+                step0_logits_indices=step0_logits_indices,
+                hidden_states_out=hidden_states_out,
+                live_batch_size=live_batch_size,
+            )
+        return self._build_fused_tail_state(
+            step0_draft_token_ids=step0_draft_token_ids,
+            step0_logits_indices=step0_logits_indices,
+            hidden_states_out=hidden_states_out,
+        )
+
+    def _build_compact_tail_live_state(
+        self,
+        step0_draft_token_ids: torch.Tensor,
+        step0_logits_indices: torch.Tensor,
+        hidden_states_out: torch.Tensor,
+        live_batch_size: int,
+    ) -> TailLiveState:
+        """Build a compact live-lane tail state for future tail-graph use.
+
+        Unlike `_build_fused_tail_state`, which preserves the current graph's
+        full companion-lane width, this helper intentionally narrows the tail
+        state to the business-level live request lanes. It is not wired into
+        the runtime path yet; it serves as the structural entry point for the
+        eventual `tail live-lane graph` refactor.
+        """
+        live_batch_size = max(int(live_batch_size), 1)
+        compact_indices = step0_logits_indices[:live_batch_size]
+        return self._make_tail_live_state(
+            step0_draft_token_ids=step0_draft_token_ids[:live_batch_size],
+            live_token_indices_to_sample=self.arange[:live_batch_size],
+            live_positions=self.positions[compact_indices],
+            live_hidden_states=hidden_states_out[compact_indices],
+            state_batch_size=live_batch_size,
+            sample_batch_size=live_batch_size,
+        )
+
+    def _make_tail_live_state(
+        self,
+        step0_draft_token_ids: torch.Tensor,
+        live_token_indices_to_sample: torch.Tensor,
+        live_positions: torch.Tensor,
+        live_hidden_states: torch.Tensor,
+        state_batch_size: int,
+        sample_batch_size: int,
+    ) -> TailLiveState:
+        return TailLiveState(
+            step0_draft_token_ids=step0_draft_token_ids,
+            live_token_indices_to_sample=live_token_indices_to_sample,
+            live_positions=live_positions,
+            live_hidden_states=live_hidden_states,
+            state_batch_size=int(state_batch_size),
+            sample_batch_size=int(sample_batch_size),
+        )
+
+    def _run_fused_tail_steps(
+        self,
+        raw_model: nn.Module,
+        forward_context,
+        draft_attn_metadatas,
+        tail_state: TailLiveState,
+        num_tokens: int,
+        work_input_ids: torch.Tensor,
+        do_state_debug: bool,
+        capture_step_snapshots: list[dict[str, Any]] | None,
+    ) -> tuple[torch.Tensor, list[dict[str, Any]] | None]:
+        draft_token_ids_tensor = torch.zeros(
+            (self.num_speculative_tokens, *tail_state.step0_draft_token_ids.shape),
+            dtype=tail_state.step0_draft_token_ids.dtype,
+            device=self.device,
+        )
+        draft_token_ids_tensor[0] = tail_state.step0_draft_token_ids
+        step_batch_size = tail_state.state_batch_size
+        step_positions = tail_state.live_positions
+        step_hidden_states = tail_state.live_hidden_states
+        token_indices_to_sample = tail_state.live_token_indices_to_sample[:tail_state.sample_batch_size]
         for draft_step in range(self.num_speculative_tokens - 1):
             if self._state_debug and self._state_debug_interval > 0 and self._state_debug_counter % self._state_debug_interval == 0:
                 logger.info(
@@ -871,11 +1059,25 @@ class SpecDecodeBaseProposer(EagleProposer):
                 step_positions >= self.vllm_config.model_config.max_model_len)
             clamped_positions = torch.where(exceeds_max_model_len, 0,
                                             step_positions)
+            if do_state_debug:
+                try:
+                    step_input_dbg = step_input_ids[: min(4, step_input_ids.shape[0])].detach().to("cpu").tolist()
+                    step_pos_dbg = clamped_positions[: min(4, clamped_positions.shape[0])].detach().to("cpu").tolist()
+                    step_idx_dbg = token_indices_to_sample[: min(4, token_indices_to_sample.shape[0])].detach().to("cpu").tolist()
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] graph_step%d_input input_head=%s pos_head=%s sample_idx_head=%s",
+                        draft_step + 1,
+                        step_input_dbg,
+                        step_pos_dbg,
+                        step_idx_dbg,
+                    )
+                except Exception as _e:
+                    logger.warning("[MTP_FUSED_DEBUG] graph_step%d_input failed: %s", draft_step + 1, repr(_e))
 
             work_input_ids = work_input_ids.clone()
-            work_input_ids[:batch_size] = step_input_ids
-            self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = step_hidden_states
+            work_input_ids[:step_batch_size] = step_input_ids
+            self._set_positions(step_batch_size, clamped_positions)
+            self.hidden_states[:step_batch_size] = step_hidden_states
 
             model_input_ids = work_input_ids
             model_positions = self._get_positions(num_tokens)
@@ -934,10 +1136,67 @@ class SpecDecodeBaseProposer(EagleProposer):
             sample_hs = last_hidden_states[token_indices_to_sample]
             logits = raw_model.compute_logits(sample_hs)
             draft_token_ids = logits.argmax(dim=-1)
+            if do_state_debug:
+                try:
+                    vocab_n = min(4, logits.shape[-1]) if logits.ndim > 1 else 0
+                    draft_head_dbg = draft_token_ids[: min(4, draft_token_ids.shape[0])].detach().to("cpu").tolist()
+                    step_pos_dbg = clamped_positions[: min(4, clamped_positions.shape[0])].detach().to("cpu").tolist()
+                    hs_l2 = float(sample_hs.float().pow(2).mean().sqrt().item()) if sample_hs.numel() > 0 else 0.0
+                    logits_topk_dbg = []
+                    logits_topv_dbg = []
+                    if logits.ndim == 2 and logits.shape[0] > 0 and vocab_n > 0:
+                        topv, topi = torch.topk(logits[:1], k=vocab_n, dim=-1)
+                        logits_topk_dbg = topi[0].detach().to("cpu").tolist()
+                        logits_topv_dbg = [float(x) for x in topv[0].detach().to("cpu").tolist()]
+                    logger.info(
+                        "[MTP_FUSED_DEBUG] graph_step%d_logits_probe pos_head=%s draft_head=%s hs_l2=%.6f top_idx=%s top_val=%s",
+                        draft_step + 1,
+                        step_pos_dbg,
+                        draft_head_dbg,
+                        hs_l2,
+                        logits_topk_dbg,
+                        logits_topv_dbg,
+                    )
+                except Exception as _e:
+                    logger.warning("[MTP_FUSED_DEBUG] graph_step%d_logits_probe failed: %s", draft_step + 1, repr(_e))
+            if capture_step_snapshots is not None:
+                capture_step_snapshots.append({
+                    "step": draft_step + 1,
+                    "input_head": step_input_ids[: min(4, step_input_ids.shape[0])].clone(),
+                    "pos_head": clamped_positions[: min(4, clamped_positions.shape[0])].clone(),
+                    "sample_idx_head": token_indices_to_sample[: min(4, token_indices_to_sample.shape[0])].clone(),
+                    "draft_head": draft_token_ids[: min(4, draft_token_ids.shape[0])].clone(),
+                    "meta_len": len(draft_attn_metadatas) if draft_attn_metadatas is not None else -1,
+                    "selected_meta_id": id(draft_attn_metadatas[draft_step + 1]) if draft_attn_metadatas and draft_step + 1 < len(draft_attn_metadatas) else -1,
+                })
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
-            step_hidden_states = hidden_states_out[:batch_size]
+            step_hidden_states = hidden_states_out[:step_batch_size]
 
-        return draft_token_ids_tensor.swapaxes(0, 1)
+        return draft_token_ids_tensor, capture_step_snapshots
+
+    def propose_tail_live_graph(
+        self,
+        tail_state: TailLiveState,
+        num_tokens: int,
+        num_input_tokens: int,
+        multi_steps_attn_metadata,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dedicated entry point for the future tail live-lane graph.
+
+        This is intentionally not wired into the runtime path yet. The goal is
+        to provide a stable call boundary so later refactors can swap the
+        current companion-lane later-step rollout for a compact live-lane graph
+        without reshaping callers again.
+        """
+        return self._run_merged_tail_steps(
+            tail_state=tail_state,
+            num_tokens=num_tokens,
+            num_input_tokens=num_input_tokens,
+            inputs_embeds=inputs_embeds,
+            multi_steps_attn_metadata=multi_steps_attn_metadata,
+            shadow_step_snapshots=None,
+        )
 
     def shallow_copy_metadata(self, attn_metadata):
         # Currently, new objects will be assigned to the lists in attn_metadata
@@ -971,9 +1230,12 @@ class SpecDecodeBaseProposer(EagleProposer):
         ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
 
         multi_steps_attn_metadata = []
+        requested_aclgraph_runtime_mode = aclgraph_runtime_mode
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        # Build per-step draft metadata from the requested fused runtime mode
+        # even when the drafter itself does not dispatch through aclgraph.
+        if requested_aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.draft_attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -995,6 +1257,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 # This is used to hold a position.
                 slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
                 positions=self.runner.positions.gpu,
+                positions_cpu=self.runner.positions.cpu,
                 attn_state=self.runner.attn_state,
                 decode_token_per_req=self.runner.decode_token_per_req,
                 max_seq_len=0,
@@ -1008,6 +1271,19 @@ class SpecDecodeBaseProposer(EagleProposer):
 
             assert len(self.draft_attn_groups) > 0
             builder = self.draft_attn_groups[0].get_metadata_builder()
+            build_for_graph_capture_params = inspect.signature(builder.build_for_graph_capture).parameters
+            supports_builder_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in build_for_graph_capture_params.values()
+            )
+            extra_attn_metadata_args = {}
+            if supports_builder_kwargs:
+                extra_attn_metadata_args = dict(
+                    prefill_ratio_to_sas_metadata=dict(),
+                    decode_ratio_to_sas_metadata=dict(),
+                    common_ratio_to_sas_metadata=dict(),
+                    block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
+                )
             # update the tensor's address for each step.
             for draft_step in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
@@ -1016,6 +1292,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 attn_metadata_eagle = builder.build_for_graph_capture(
                     common_attn_metadata,
                     AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+                    **extra_attn_metadata_args,
                 )
                 per_layer_attn_metadata = dict()
                 for layer_name in self.attn_layer_names:
@@ -1023,6 +1300,12 @@ class SpecDecodeBaseProposer(EagleProposer):
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         self._last_dummy_attn_metadata = multi_steps_attn_metadata
+        if _mtp_meta_chain_enabled():
+            logger.info(
+                "[MTP_META_CHAIN] dummy_run_saved total_steps=%d %s",
+                self.num_speculative_tokens,
+                _mtp_meta_chain_summary(self._last_dummy_attn_metadata),
+            )
 
         model_positions = self._get_positions(num_tokens)
 
@@ -1171,6 +1454,26 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             inputs_embeds = None
 
+        active_tail_runnable = self._tail_live_runnable if getattr(
+            self, "_tail_live_graph_enabled", False
+        ) else self._runnable
+        compact_live_lanes = active_tail_runnable is self._tail_live_runnable
+        # Current compact tail-live path is not shape-stable with mRoPE models.
+        # Guard it off to avoid runtime rotary kernel crashes.
+        if compact_live_lanes and self.uses_mrope:
+            if not getattr(self, "_tail_live_graph_mrope_disabled_logged", False):
+                logger.warning(
+                    "[MTP_FUSED_DEBUG] disable tail_live_graph for mRoPE model; fallback to stable tail runnable"
+                )
+                self._tail_live_graph_mrope_disabled_logged = True
+            active_tail_runnable = self._runnable
+            compact_live_lanes = False
+        token_indices_to_sample_len = token_indices_to_sample.shape[0]
+        tail_batch_size = token_indices_to_sample_len if compact_live_lanes else batch_size
+        # For compact tail-live lanes, later-step metadata/input widths must
+        # follow the live lane count instead of graph-padded input width.
+        tail_num_input_tokens = tail_batch_size if compact_live_lanes else num_input_tokens
+
         # Update slot_mapping for different speculative.
         # NOTE: Currently, we only remake the slot_mapping, because it's the
         # only tensor which will be used in current FIA.
@@ -1180,7 +1483,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
-        common_attn_metadata.num_input_tokens = num_input_tokens
+        common_attn_metadata.num_input_tokens = tail_num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
         builder = self.draft_attn_groups[0].get_metadata_builder()
@@ -1192,31 +1495,83 @@ class SpecDecodeBaseProposer(EagleProposer):
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
         attn_metadata = self._freeze_draft_step_attn_metadata(attn_metadata)
 
+        multi_steps_attn_metadata, attn_metadata_i = self._build_multi_steps_attn_metadata(
+            common_attn_metadata=common_attn_metadata,
+            token_indices_to_sample=token_indices_to_sample,
+            attn_metadata=attn_metadata,
+            batch_size=tail_batch_size,
+            num_input_tokens=tail_num_input_tokens,
+            aclgraph_runtime_mode=aclgraph_runtime_mode,
+            compact_live_lanes=compact_live_lanes,
+            query_lens_d=query_lens_d if self.pcp_size * self.dcp_size > 1 else None,
+            ori_token_indices_to_sample=ori_token_indices_to_sample if self.pcp_size * self.dcp_size > 1 else None,
+            num_decode_reqs=num_decode_reqs,
+        )
+
+        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+
+        with set_ascend_forward_context(
+            multi_steps_attn_metadata[0],
+            self.vllm_config,
+            num_tokens=tail_num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_actual_tokens=num_tokens,
+            batch_descriptor=batch_descriptor,
+            aclgraph_runtime_mode=aclgraph_runtime_mode,
+            is_draft_model=True,
+            draft_attn_metadatas=multi_steps_attn_metadata,
+        ):
+            # Reset MOE layer index for forward pass
+            forward_context = get_forward_context()
+            if forward_context is not None:
+                forward_context.moe_layer_index = 0
+
+            draft_token_ids = active_tail_runnable(
+                num_input_tokens=tail_num_input_tokens,
+                batch_size=tail_batch_size,
+                token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
+                target_positions=target_positions,
+                inputs_embeds=inputs_embeds,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                num_tokens=num_tokens,
+                is_prefill=attn_metadata_i.num_prefills,
+            )
+
+            forward_context = get_forward_context()
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and active_tail_runnable is self._runnable
+            ):
+                self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
+        return draft_token_ids
+
+    def _build_multi_steps_attn_metadata(
+        self,
+        common_attn_metadata,
+        token_indices_to_sample: torch.Tensor,
+        attn_metadata,
+        batch_size: int,
+        num_input_tokens: int,
+        aclgraph_runtime_mode: CUDAGraphMode,
+        compact_live_lanes: bool,
+        query_lens_d=None,
+        ori_token_indices_to_sample=None,
+        num_decode_reqs: int = 0,
+    ) -> tuple[list[dict[str, Any]], Any]:
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
         per_layer_attn_metadata = dict()
-        # The first step of speculative.
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
-        # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
-
-        # Clone the data so that when calculating the data at position 2 and position 3
-        # in the merged graph, it does not affect position 1
-        # FIXME(lilinsiman)
         common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
 
         if self.pcp_size * self.dcp_size > 1:
             if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
-                # For pcp/dcp, tokens are split across different cp ranks,
-                # so we can not simply update slot_mapping by += 1.
-                # Instead, we pre-allocate mtp slot_mapping in model_runner
-                # (_generate_pcp_mtp_input), and use updated slot_indices
-                # to get corresponding slot_mapping in each step.
                 num_reject_tokens = (
                     torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
                     - ori_token_indices_to_sample
@@ -1226,8 +1581,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 ori_seq_len = attn_metadata_i.seq_lens_cpu[:batch_size].clone()
                 mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
 
-                # slot_mapping index base offset:
-                # scheduled tokens + pre-allocated mtp tokens + accepted tokens
                 slot_idx_base = (
                     torch.cat(
                         [
@@ -1247,7 +1600,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                     )
                 slot_indices = torch.cat(slot_indices_list, dim=0)
 
-                # fold block_table (restore it to original size before flattened)
                 block_indices = torch.cat(
                     [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
                 )
@@ -1256,7 +1608,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 ]
                 common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
 
-                # Copy the old attn_metadata and update
                 if not self.parallel_drafting:
                     for draft_step in range(1, self.num_speculative_tokens):
                         per_layer_attn_metadata = dict()
@@ -1273,13 +1624,13 @@ class SpecDecodeBaseProposer(EagleProposer):
                                 slot_indices,
                                 mtp_slot_mapping,
                                 attn_group=attn_group,
+                                compact_live_lanes=compact_live_lanes,
                             )
                             attn_metadata = self._freeze_draft_step_attn_metadata(attn_metadata)
                             for layer_name in self.attn_layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
-            # Copy the old attn_metadata and update
             if not self.parallel_drafting:
                 for draft_step in range(1, self.num_speculative_tokens):
                     per_layer_attn_metadata = dict()
@@ -1293,46 +1644,14 @@ class SpecDecodeBaseProposer(EagleProposer):
                             used_update_positions,
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
+                            compact_live_lanes=compact_live_lanes,
                         )
                         attn_metadata = self._freeze_draft_step_attn_metadata(attn_metadata)
                         for layer_name in self.attn_layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
-        token_indices_to_sample_len = token_indices_to_sample.shape[0]
-        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
-
-        with set_ascend_forward_context(
-            multi_steps_attn_metadata[0],
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            num_actual_tokens=num_tokens,
-            batch_descriptor=batch_descriptor,
-            aclgraph_runtime_mode=aclgraph_runtime_mode,
-            is_draft_model=True,
-            draft_attn_metadatas=multi_steps_attn_metadata,
-        ):
-            # Reset MOE layer index for forward pass
-            forward_context = get_forward_context()
-            if forward_context is not None:
-                forward_context.moe_layer_index = 0
-
-            draft_token_ids = self._runnable(
-                num_input_tokens=num_input_tokens,
-                batch_size=batch_size,
-                token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
-                target_positions=target_positions,
-                inputs_embeds=inputs_embeds,
-                multi_steps_attn_metadata=multi_steps_attn_metadata,
-                num_tokens=num_tokens,
-                is_prefill=attn_metadata_i.num_prefills,
-            )
-
-            forward_context = get_forward_context()
-            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
-        return draft_token_ids
+        return multi_steps_attn_metadata, attn_metadata_i
 
     def _run_merged_draft(
         self,
@@ -1345,6 +1664,94 @@ class SpecDecodeBaseProposer(EagleProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
+        draft_token_ids, hidden_states, token_indices_to_sample, shadow_step_snapshots = (
+            self._run_merged_step0(
+                num_input_tokens=num_input_tokens,
+                token_indices_to_sample=token_indices_to_sample,
+                inputs_embeds=inputs_embeds,
+                num_tokens=num_tokens,
+            ))
+
+        # Early exit if there is only one draft token to be generated.
+        if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            return draft_token_ids.view(-1, self.num_speculative_tokens)
+
+        if self.pcp_size * self.dcp_size > 1 and is_prefill:
+            draft_token_ids_list = []
+            for _ in range(self.num_speculative_tokens):
+                draft_token_ids_list.append(draft_token_ids)
+            return torch.stack(draft_token_ids_list, dim=1)
+
+        tail_state = self._build_tail_live_state(
+            step0_draft_token_ids=draft_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+        )
+        draft_token_ids = self._run_merged_tail_steps(
+            tail_state=tail_state,
+            num_tokens=num_tokens,
+            num_input_tokens=num_input_tokens,
+            inputs_embeds=inputs_embeds,
+            multi_steps_attn_metadata=multi_steps_attn_metadata,
+            shadow_step_snapshots=shadow_step_snapshots,
+        )
+        if shadow_step_snapshots is not None:
+            self._shadow_multistep_snapshot = shadow_step_snapshots
+        return draft_token_ids
+
+    def _run_compact_tail_live_draft(
+        self,
+        num_input_tokens,
+        batch_size,
+        token_indices_to_sample,
+        target_positions,
+        inputs_embeds,
+        multi_steps_attn_metadata,
+        num_tokens,
+        is_prefill=None,
+    ) -> torch.Tensor:
+        draft_token_ids, hidden_states, token_indices_to_sample, shadow_step_snapshots = (
+            self._run_merged_step0(
+                num_input_tokens=num_input_tokens,
+                token_indices_to_sample=token_indices_to_sample,
+                inputs_embeds=inputs_embeds,
+                num_tokens=num_tokens,
+            ))
+
+        if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            return draft_token_ids.view(-1, self.num_speculative_tokens)
+
+        if self.pcp_size * self.dcp_size > 1 and is_prefill:
+            draft_token_ids_list = []
+            for _ in range(self.num_speculative_tokens):
+                draft_token_ids_list.append(draft_token_ids)
+            return torch.stack(draft_token_ids_list, dim=1)
+
+        tail_state = self._build_tail_live_state(
+            step0_draft_token_ids=draft_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+        )
+        draft_token_ids = self.propose_tail_live_graph(
+            tail_state=tail_state,
+            num_tokens=num_tokens,
+            num_input_tokens=num_input_tokens,
+            multi_steps_attn_metadata=multi_steps_attn_metadata,
+            inputs_embeds=inputs_embeds,
+        )
+        if shadow_step_snapshots is not None:
+            self._shadow_multistep_snapshot = shadow_step_snapshots
+        return draft_token_ids
+
+    def _run_merged_step0(
+        self,
+        num_input_tokens: int,
+        token_indices_to_sample: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]] | None]:
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
@@ -1398,6 +1805,8 @@ class SpecDecodeBaseProposer(EagleProposer):
                 token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
             )
 
+        shadow_step_snapshots = [] if _mtp_meta_chain_enabled() else None
+
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         logits = self.model.compute_logits(sample_hidden_states)
 
@@ -1406,59 +1815,89 @@ class SpecDecodeBaseProposer(EagleProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+        if shadow_step_snapshots is not None:
+            shadow_step_snapshots.append({
+                "step": 0,
+                "input_head": model_input_ids[: min(4, model_input_ids.shape[0])].clone(),
+                "pos_head": model_positions[: min(4, model_positions.shape[0])].clone(),
+                "sample_idx_head": token_indices_to_sample[: min(4, token_indices_to_sample.shape[0])].clone(),
+                "draft_head": draft_token_ids[: min(4, draft_token_ids.shape[0])].clone(),
+            })
+        return draft_token_ids, hidden_states, token_indices_to_sample, shadow_step_snapshots
 
-        # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            # [batch_size, 1]
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
-
-        if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            draft_token_ids = logits.argmax(dim=-1)
-            draft_token_ids_list = []
-            for _ in range(self.num_speculative_tokens):
-                draft_token_ids_list.append(draft_token_ids)
-            return torch.stack(draft_token_ids_list, dim=1)
-
-        # Generate the remaining draft tokens.
-        draft_token_ids_tensor = torch.zeros(
-            (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
-        )
-        draft_token_ids_tensor[0] = draft_token_ids
+    def _build_tail_live_state(
+        self,
+        step0_draft_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        hidden_states: torch.Tensor,
+        batch_size: int,
+    ) -> TailLiveState:
+        # Compact tail state dimensions must follow live sample lanes, not the
+        # caller-provided batch size, otherwise positions/hidden_states dim0
+        # can diverge and break rotary kernels.
+        live_batch_size = int(token_indices_to_sample.shape[0])
         if self.uses_mrope:
-            positions = self.mrope_positions[:, token_indices_to_sample]
+            live_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
-            positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
-        token_indices_to_sample = self.arange[:batch_size]
+            live_positions = self.positions[token_indices_to_sample]
+        live_hidden_states = hidden_states[token_indices_to_sample]
+        step0_draft_token_ids = step0_draft_token_ids[:live_batch_size]
+        return self._make_tail_live_state(
+            step0_draft_token_ids=step0_draft_token_ids,
+            live_token_indices_to_sample=token_indices_to_sample,
+            live_positions=live_positions,
+            live_hidden_states=live_hidden_states,
+            state_batch_size=live_batch_size,
+            sample_batch_size=live_batch_size,
+        )
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+    def _run_merged_tail_steps(
+        self,
+        tail_state: TailLiveState,
+        num_tokens: int,
+        num_input_tokens: int,
+        inputs_embeds: torch.Tensor | None,
+        multi_steps_attn_metadata,
+        shadow_step_snapshots: list[dict[str, Any]] | None,
+    ) -> torch.Tensor:
+        draft_token_ids_tensor = torch.zeros(
+            (self.num_speculative_tokens, *tail_state.step0_draft_token_ids.shape),
+            dtype=tail_state.step0_draft_token_ids.dtype,
+            device=self.device,
+        )
+        draft_token_ids_tensor[0] = tail_state.step0_draft_token_ids
+        positions = tail_state.live_positions
+        hidden_states = tail_state.live_hidden_states
+        batch_size = tail_state.state_batch_size
+        token_indices_to_sample = self.arange[:tail_state.sample_batch_size]
+
+        # For compact tail live-lane execution, the later-step model input must
+        # follow live state width; reusing num_input_tokens can desync shapes
+        # between positions/metadata/hidden_states on rotary kernels.
+        use_compact_tail_live = (
+            getattr(self, "_tail_live_graph_enabled", False)
+            and batch_size < num_input_tokens
+        )
+        input_batch_size = (
+            batch_size
+            if use_compact_tail_live
+            else (num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size)
+        )
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
 
         for draft_step in range(self.num_speculative_tokens - 1):
-            # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_tensor[draft_step]
             positions += 1
 
-            # NOTE(woosuk): We should handle the case where the draft model
-            # generates tokens beyond the max model length. Since it is complex
-            # to remove such requests from the batch, we keep them in the batch
-            # but adjust the position ids and slot mappings to avoid the
-            # out-of-range access during the model execution. The draft tokens
-            # generated with this adjustment should be ignored.
             if self.uses_mrope:
                 exceeds_max_model_len = positions[0] >= self.vllm_config.model_config.max_model_len
-                # Mask out the position ids that exceed the max model length.
-                # Otherwise, we may get out-of-range error in RoPE.
                 clamped_positions = torch.where(
                     exceeds_max_model_len.unsqueeze(0), torch.zeros_like(positions), positions
                 )
@@ -1466,29 +1905,22 @@ class SpecDecodeBaseProposer(EagleProposer):
                 exceeds_max_model_len = positions >= self.vllm_config.model_config.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
-            # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
             self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
-
                 input_ids = self.input_ids[:input_batch_size]
                 inputs_embeds = self.inputs_embeds[:input_batch_size]
             else:
                 input_ids = self.input_ids[:input_batch_size]
                 inputs_embeds = None
 
-            # Run the model.
-
-            # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
-            # speculative tokens' proposings. `model_input_ids`, `model_positions` and
-            # `model_hidden_states` represent the speculative model inputs.
             model_input_ids = self.input_ids[:input_batch_size]
             model_positions = self._get_positions(input_batch_size)
             model_hidden_states = self.hidden_states[:input_batch_size]
-
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                model_hidden_states, model_positions)
 
             forward_context.attn_metadata = (
                 multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
@@ -1510,8 +1942,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
-                last_hidden_states, model_positions, hidden_states
-            )
+                last_hidden_states, model_positions, hidden_states)
 
             num_indices = token_indices_to_sample.shape[0]
             if lmhead_tp_enable():
@@ -1530,14 +1961,19 @@ class SpecDecodeBaseProposer(EagleProposer):
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
 
-            # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
+            if shadow_step_snapshots is not None:
+                shadow_step_snapshots.append({
+                    "step": draft_step + 1,
+                    "input_head": input_ids[: min(4, input_ids.shape[0])].clone(),
+                    "pos_head": clamped_positions[: min(4, clamped_positions.shape[0])].clone(),
+                    "sample_idx_head": token_indices_to_sample[: min(4, token_indices_to_sample.shape[0])].clone(),
+                    "draft_head": draft_token_ids[: min(4, draft_token_ids.shape[0])].clone(),
+                })
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        return draft_token_ids
+        return draft_token_ids_tensor.swapaxes(0, 1)
 
     def set_inputs_first_pass(
         self,
@@ -1740,13 +2176,14 @@ class SpecDecodeBaseProposer(EagleProposer):
         slot_indices=None,
         mtp_slot_mapping=None,
         attn_group=None,
+        compact_live_lanes: bool = False,
     ):
         assert draft_step > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
         if draft_step == 1:
-            if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL and not compact_live_lanes:
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._pad_tensor(
                     common_attn_metadata.block_table_tensor, input_batch_size
@@ -1763,6 +2200,14 @@ class SpecDecodeBaseProposer(EagleProposer):
                     self.token_arange_np[: input_batch_size + 1]
                 ).clone()
             else:
+                common_attn_metadata.num_reqs = batch_size
+                if compact_live_lanes:
+                    common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
+                    common_attn_metadata.seq_lens = common_attn_metadata.seq_lens[:batch_size]
+                    common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:batch_size]
+                    common_attn_metadata.num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu[
+                        :batch_size
+                    ]
                 common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
                 common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                     self.token_arange_np[: batch_size + 1]
@@ -1775,7 +2220,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
             )
             common_attn_metadata.graph_pad_size = -1
-            common_attn_metadata.num_input_tokens = input_batch_size
+            common_attn_metadata.num_input_tokens = batch_size if compact_live_lanes else input_batch_size
 
         # The loop part
         used_update_positions += 1
